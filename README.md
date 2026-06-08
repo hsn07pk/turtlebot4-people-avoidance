@@ -43,6 +43,7 @@ Three files to implement, in order:
 | [DEVELOPMENT_GUIDE.md](DEVELOPMENT_GUIDE.md) | Implementing the algorithm — data contract, equations, hints |
 | [REAL_ROBOT.md](REAL_ROBOT.md) | Lab session — connect to the TB4, run your node, tune parameters |
 | [SIMULATION.md](SIMULATION.md) | Optional — test your algorithm offline when no robot is available |
+| [DOCKER.md](DOCKER.md) | Optional — run everything inside Docker (any OS) |
 
 ---
 
