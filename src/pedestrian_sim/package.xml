@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>pedestrian_sim</name>
+  <version>0.1.0</version>
+  <description>
+    Spawns cylindrical leg-pair models in Gazebo and drives them with a bounded
+    random walk.  Produces realistic two-blob LiDAR returns for the people-avoidance
+    teaching pipeline.
+  </description>
+  <maintainer email="instructor@example.com">Instructor</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>ros_gz_sim</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

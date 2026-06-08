@@ -1,0 +1,82 @@
+---
+# People Avoidance — Docker Compose
+#
+# Three profiles:
+#   sim       — Gazebo simulation + pedestrians  (needs display)
+#   avoidance — people_avoidance skeleton node
+#   all       — both together (requires adequate resources)
+#
+# Usage:
+#   docker compose --profile sim       up        # start simulator
+#   docker compose --profile avoidance up        # start student node
+#   docker compose --profile all       up        # start everything
+#   docker compose down                          # stop all containers
+#
+# Display: the host X11 socket is mounted.  Run once before docker compose:
+#   xhost +local:docker
+#
+# GPU:  the 'gpu' service variant uses NVIDIA runtime.
+#       On machines without NVIDIA, use the 'sim' service (software rendering).
+
+x-common: &common
+  build:
+    context: ..
+    dockerfile: docker/Dockerfile
+  network_mode: host           # simplest networking; gz-transport requires broadcast
+  environment:
+    - DISPLAY=${DISPLAY}
+    - GZ_IP=127.0.0.1
+    - TURTLEBOT4_MODEL=standard
+  volumes:
+    - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    # Mount student code as a volume so edits on the host are reflected immediately
+    - ../src/people_avoidance:/ros2_ws/src/people_avoidance:rw
+
+services:
+
+  # ── Simulation (no GPU required — uses software rendering) ──────────────────
+  sim:
+    <<: *common
+    container_name: people_avoidance_sim
+    profiles: [sim, all]
+    environment:
+      - DISPLAY=${DISPLAY}
+      - GZ_IP=127.0.0.1
+      - TURTLEBOT4_MODEL=standard
+    command: >
+      ros2 launch pedestrian_sim simulation.launch.py
+
+  # ── Simulation with NVIDIA GPU ───────────────────────────────────────────────
+  sim-gpu:
+    <<: *common
+    container_name: people_avoidance_sim_gpu
+    profiles: [sim-gpu]
+    environment:
+      - DISPLAY=${DISPLAY}
+      - GZ_IP=127.0.0.1
+      - TURTLEBOT4_MODEL=standard
+      - __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    command: >
+      ros2 launch pedestrian_sim simulation.launch.py
+
+  # ── People-avoidance skeleton node ──────────────────────────────────────────
+  avoidance:
+    <<: *common
+    container_name: people_avoidance_node
+    profiles: [avoidance, all]
+    # Rebuild the workspace before starting so students' edits take effect
+    command: >
+      bash -c "
+        source /opt/ros/jazzy/setup.bash &&
+        cd /ros2_ws &&
+        colcon build --packages-select people_avoidance --symlink-install --event-handlers console_direct+ &&
+        source install/setup.bash &&
+        ros2 launch people_avoidance people_avoidance.launch.py
+      "

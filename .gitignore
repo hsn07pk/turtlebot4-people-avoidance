@@ -1,0 +1,30 @@
+# ROS 2 colcon build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Gazebo / ROS logs
+~/.ros/
+*.bag
+*.db3
+
+# Environment files
+.env

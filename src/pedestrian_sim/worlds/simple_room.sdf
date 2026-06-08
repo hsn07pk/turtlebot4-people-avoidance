@@ -1,0 +1,107 @@
+<?xml version="1.0" encoding="ASCII"?>
+<!--
+  simple_room.sdf  —  Open 10 × 10 m room, no Gazebo Fuel dependencies.
+
+  Modelled after the TB4 warehouse.sdf (turtlebot4_gz_bringup):
+    • Sensors plugin is intentionally absent: the TB4 devs comment it out in
+      warehouse.sdf with the note "Fix lighting so that spawning multiple robots
+      does not crash the sim". Gz-sim loads it automatically from the robot model.
+    • <light> element is also absent for the same reason.
+    • Physics / UserCommands / SceneBroadcaster / Contact plugins are present,
+      matching warehouse.sdf exactly.
+
+  <world name="warehouse"> is intentional: the ros-gz bridge topic path is
+  /world/warehouse/model/turtlebot4/... so this name must stay "warehouse".
+-->
+<sdf version="1.7">
+  <world name="warehouse">
+
+    <physics type="ode">
+      <max_step_size>0.003</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <plugin name="gz::sim::systems::Physics"         filename="gz-sim-physics-system"/>
+    <plugin name="gz::sim::systems::UserCommands"    filename="gz-sim-user-commands-system"/>
+    <plugin name="gz::sim::systems::SceneBroadcaster" filename="gz-sim-scene-broadcaster-system"/>
+    <plugin name="gz::sim::systems::Contact"         filename="gz-sim-contact-system"/>
+    <!-- Sensors plugin intentionally omitted: see warehouse.sdf note about crashes.
+         Gz-sim loads it automatically when the robot model with sensor elements spawns. -->
+
+    <scene>
+      <ambient>1 1 1 1</ambient>
+      <background>0.3 0.7 0.9 1</background>
+      <shadows>0</shadows>
+      <grid>false</grid>
+    </scene>
+    <!-- <light> intentionally omitted: crashes Ogre2 renderer on TB4 sim. -->
+
+    <!-- Ground plane -->
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry>
+            <plane><normal>0 0 1</normal><size>1 1</size></plane>
+          </geometry>
+        </collision>
+        <visual name="visual">
+          <geometry>
+            <plane><normal>0 0 1</normal><size>20 20</size></plane>
+          </geometry>
+          <material>
+            <ambient>0.7 0.7 0.7 1</ambient>
+            <diffuse>0.7 0.7 0.7 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <!-- Room walls: 10 × 10 m interior, 0.2 m thick, 2.5 m tall.
+         Solid collision so the LiDAR sees them and pedestrians stay inside. -->
+    <model name="wall_north">
+      <static>true</static><pose>0 5.1 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>10.4 0.2 2.5</size></box></geometry></collision>
+        <visual name="vis">
+          <geometry><box><size>10.4 0.2 2.5</size></box></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_south">
+      <static>true</static><pose>0 -5.1 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>10.4 0.2 2.5</size></box></geometry></collision>
+        <visual name="vis">
+          <geometry><box><size>10.4 0.2 2.5</size></box></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_east">
+      <static>true</static><pose>5.1 0 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.2 10.4 2.5</size></box></geometry></collision>
+        <visual name="vis">
+          <geometry><box><size>0.2 10.4 2.5</size></box></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="wall_west">
+      <static>true</static><pose>-5.1 0 1.25 0 0 0</pose>
+      <link name="link">
+        <collision name="col"><geometry><box><size>0.2 10.4 2.5</size></box></geometry></collision>
+        <visual name="vis">
+          <geometry><box><size>0.2 10.4 2.5</size></box></geometry>
+          <material><ambient>0.9 0.9 0.9 1</ambient><diffuse>0.9 0.9 0.9 1</diffuse></material>
+        </visual>
+      </link>
+    </model>
+
+  </world>
+</sdf>
