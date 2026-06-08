@@ -29,7 +29,8 @@ The TurtleBot4 is on the same network.
 
 Check connectivity — the robot's topics should appear:
 ```bash
-source ~/.zshrc         # loads ROS_DOMAIN_ID
+source ~/.zshrc    # zsh — loads ROS_DOMAIN_ID
+# source ~/.bashrc # bash
 ros2 topic list | grep -E "^/scan$|^/cmd_vel$|^/odom$"
 ```
 
@@ -57,7 +58,8 @@ decrease as you approach.
 
 ```bash
 conda deactivate
-source ~/ros2_ws/install/setup.zsh
+source ~/ros2_ws/install/setup.zsh    # zsh
+# source ~/ros2_ws/install/setup.bash # bash
 ros2 launch people_avoidance people_avoidance.launch.py
 ```
 

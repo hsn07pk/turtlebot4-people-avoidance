@@ -78,7 +78,7 @@ ros2 topic hz /scan
 
 ## Docker (any operating system)
 
-If you are not on Ubuntu 24.04, use Docker:
+If you are not on Ubuntu 22.04 or 24.04, use Docker:
 
 ```bash
 # Build image once (~10 min)
