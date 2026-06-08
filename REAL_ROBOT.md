@@ -1,186 +1,183 @@
-# Running on a Real TurtleBot4
+# Running on the TurtleBot4
 
-This guide assumes you have completed the simulation exercises and now want to
-deploy the `people_avoidance` node on a physical TurtleBot4 (standard or lite).
-
-> **Safety first** — the avoidance controller publishes to `/cmd_vel`.  
-> Before running on a real robot, make sure:
-> - The test area is clear and at least 3 m wide.
-> - A person is within reach of the robot's physical power button at all times.
-> - Start with `max_linear_speed: 0.1` (half the default) until you are
->   confident the controller behaves correctly.
-
----
-
-## 1 — Architecture
-
-In simulation, Gazebo and all ROS 2 nodes run on one machine.  With a real
-robot the system splits across two machines:
+This is the primary lab guide.  Your algorithm runs on your laptop and
+communicates with the physical TurtleBot4 over WiFi.
 
 ```
-┌─────────────────────────────────┐     WiFi      ┌───────────────────────────┐
-│  Your laptop                    │◄─────────────►│  TurtleBot4               │
-│                                 │               │                           │
-│  people_avoidance_node          │               │  RPi 4 running ROS 2:     │
-│    subscribes to /scan          │               │    /scan   (RPLidar A1)   │
-│    publishes to /cmd_vel        │               │    /odom   (Create3)      │
-│                                 │               │    /cmd_vel               │
-└─────────────────────────────────┘               └───────────────────────────┘
-```
-
-The robot's RPi runs the sensor drivers and motor control.  Your laptop runs
-your algorithm.  ROS 2 DDS connects them over WiFi automatically, as long as
-both are on the same network and configured with the same domain ID.
-
----
-
-## 2 — Network setup
-
-### Connect to the TB4 network
-
-The TurtleBot4 creates its own WiFi access point on first boot, or can be
-configured to join an existing network.  See the official TB4 networking guide:
-<https://turtlebot.github.io/turtlebot4-user-manual/setup/networking.html>
-
-The simplest setup for a lab:
-
-1. Connect the robot to the lab WiFi.
-2. Connect your laptop to the same WiFi.
-3. Find the robot's IP: `ros2 run turtlebot4_navigation find_turtlebot4` or
-   check the display on the robot (TB4 standard) for its IP address.
-
-### ROS 2 domain ID
-
-By default both robot and laptop use `ROS_DOMAIN_ID=0`.  If several groups
-work simultaneously, assign each group a unique domain ID (0–101):
-
-```bash
-# On your laptop — match whatever the robot's domain ID is set to
-export ROS_DOMAIN_ID=0      # default; change to match your robot
-
-# Add to ~/.zshrc to persist
-echo "export ROS_DOMAIN_ID=0" >> ~/.zshrc
-```
-
-Check that the robot is visible:
-```bash
-ros2 topic list | grep scan     # should show /scan
-ros2 node list                  # should show TB4 nodes
+Your laptop                           TurtleBot4 (RPi 4)
+─────────────────────────────         ─────────────────────────────
+people_avoidance_node                 /scan   RPLidar A1 driver
+  subscribes /scan          ◄──WiFi── /odom   Create 3 odometry
+  publishes  /cmd_vel       ──WiFi──► /cmd_vel Create 3 motor control
 ```
 
 ---
 
-## 3 — Verify topics before running
+## Before the lab
 
-Confirm the exact same topics are available on the real robot as in simulation:
+1. Your code compiles (`colcon build` succeeds with no errors).
+2. You have tested at least Stage 1 in simulation — the node does not crash
+   when it receives a scan.
+3. You know your group's `ROS_DOMAIN_ID` (given by the instructor).
+
+---
+
+## 1 — Connect to the robot network
+
+Connect your laptop to the **lab WiFi** specified by your instructor.
+The TurtleBot4 is on the same network.
+
+Check connectivity — the robot's topics should appear:
+```bash
+source ~/.zshrc         # loads ROS_DOMAIN_ID
+ros2 topic list | grep -E "^/scan$|^/cmd_vel$|^/odom$"
+```
+
+If those three topics are not listed, wait 10 seconds and retry.  If still
+missing, check with your instructor — the robot may need to be restarted.
+
+---
+
+## 2 — Verify the LiDAR
 
 ```bash
-# LiDAR — should publish at ~5 Hz
+# Should print ~5 Hz
 ros2 topic hz /scan
 
-# One scan message — ranges should vary (not all 0.164)
-ros2 topic echo --once /scan | grep ranges | head -3
-
-# Odometry
-ros2 topic echo --once /odom | grep -A3 position
-
-# Check cmd_vel is being subscribed to by the robot
-ros2 topic info /cmd_vel
+# Should show varied range values (not all the same number)
+ros2 topic echo --once /scan | grep -A5 "ranges:"
 ```
 
-### Frame ID differences: simulation vs real robot
-
-| | Simulation | Real robot |
-|--|--|--|
-| LiDAR frame_id | `turtlebot4/rplidar_link/rplidar` | `rplidar_link` |
-| Odom frame | `odom` | `odom` |
-| Base frame | `base_link` | `base_link` |
-
-The `laser_frame` ROS 2 parameter in `people_avoidance_node` is **reference only**
-(used for documentation/TF lookups, not for the core algorithm which works in the
-laser frame directly).  No change is needed to run on the real robot.
+Walk slowly in front of the robot — you should see values in the `ranges` array
+decrease as you approach.
 
 ---
 
-## 4 — Run the node
+## 3 — Run your node
 
 ```bash
-# Source your workspace
-source /opt/ros/jazzy/setup.zsh
+conda deactivate
 source ~/ros2_ws/install/setup.zsh
+ros2 launch people_avoidance people_avoidance.launch.py
+```
 
-# Launch with conservative speed limits for first run
+The node will print:
+```
+[people_avoidance] PeopleAvoidanceNode ready — listening on '/scan', publishing to '/cmd_vel'
+```
+
+**First run:** keep `max_linear_speed` low until you are confident the
+controller behaves correctly:
+
+```bash
 ros2 launch people_avoidance people_avoidance.launch.py \
     max_linear_speed:=0.1 \
     max_angular_speed:=0.5 \
     obstacle_radius_scale:=3.0
 ```
 
-You do **not** run `simulation.launch.py` or `pedestrian_sim` — those are only
-for the simulated environment.  Real people walking near the robot are the input.
+---
+
+## 4 — Verify your node is working
+
+Open a second terminal:
+
+```bash
+source ~/ros2_ws/install/setup.zsh
+
+# Watch what your node outputs — should update at ~5 Hz
+ros2 topic echo /cmd_vel
+
+# See live detections (add this print to your detect_legs() while debugging)
+ros2 run people_avoidance people_avoidance_node --ros-args --log-level debug
+```
+
+Expected progression:
+
+| Stage complete | What you observe |
+|----------------|-----------------|
+| Stubs only | `/cmd_vel` publishes zeros; robot sits still |
+| Stage 1 done | Debug log shows `LegMeasurement` entries when people are nearby |
+| Stage 2 done | Debug log shows persistent `Track` objects that survive multiple scans |
+| Stage 3 done | Robot moves away from approaching people |
 
 ---
 
-## 5 — Real-world tuning vs simulation
+## 5 — Stop the robot safely
 
-The simulation uses idealised cylinders as people.  Real legs produce messier
-scans.  Expect to tune these parameters:
-
-| Parameter | Sim default | Real-world starting point | Why |
-|-----------|-------------|--------------------------|-----|
-| `distance_threshold` | 0.10 m | 0.08–0.12 m | Real scans have more noise |
-| `leg_radius` | 0.10 m | 0.08–0.12 m | Clothing changes effective radius |
-| `max_leg_width` | 0.25 m | 0.20–0.35 m | Stance width varies |
-| `dt` | 0.1 s | Match actual scan rate | Check `ros2 topic hz /scan` |
-| `max_linear_speed` | 0.2 m/s | Start at 0.1 m/s | Increase only when tracking is reliable |
-| `obstacle_radius_scale` | 2.0 | 3.0–4.0 | More margin for real uncertainty |
-
-Override without editing code:
+Any of these works at any time:
 ```bash
-ros2 launch people_avoidance people_avoidance.launch.py \
-    distance_threshold:=0.09 \
-    max_leg_width:=0.30 \
-    max_linear_speed:=0.15
+# Publish a zero command once
+ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{}"
+
+# Press Ctrl-C in the terminal running your node
+# Press the physical power button on the Create 3 base (cuts motors)
 ```
 
 ---
 
-## 6 — Checking the robot's safety systems
+## 6 — Tuning for real-world conditions
 
-The TurtleBot4's Create 3 base has built-in reflexes that override `/cmd_vel`:
+Simulation uses idealised cylinders.  Real legs are noisier.  Start with these
+adjustments and refine during the session:
+
+| Parameter | Sim default | Real-world start | Why |
+|-----------|-------------|-----------------|-----|
+| `distance_threshold` | 0.10 m | 0.08–0.12 m | More scan noise |
+| `leg_radius` | 0.10 m | 0.08–0.12 m | Clothing varies |
+| `max_leg_width` | 0.25 m | 0.20–0.35 m | Stance width varies |
+| `dt` | 0.1 s | match `ros2 topic hz /scan` | Sync KF step to real rate |
+| `max_linear_speed` | 0.2 m/s | start at 0.1 m/s | Increase once confident |
+| `obstacle_radius_scale` | 2.0 | 3.0–4.0 | More safety margin |
+
+Override without editing code:
+```bash
+ros2 launch people_avoidance people_avoidance.launch.py \
+    distance_threshold:=0.09 max_leg_width:=0.30 max_linear_speed:=0.15
+```
+
+---
+
+## 7 — Robot safety systems
+
+The Create 3 base has built-in reflexes that override `/cmd_vel` regardless of
+what your node publishes:
 
 | Reflex | Trigger | Effect |
 |--------|---------|--------|
 | `REFLEX_BUMP` | Front bumper contact | Backs up, stops |
 | `REFLEX_CLIFF` | Cliff sensor detects drop | Stops immediately |
-| `REFLEX_WHEEL_DROP` | Wheel lifted off ground | Stops |
+| `REFLEX_WHEEL_DROP` | Wheel lifted | Stops |
 
-These are independent of your algorithm and **cannot** be disabled.  If the robot
-stops unexpectedly, check `/hazard_detection`:
+These protect the robot and cannot be disabled.  If the robot stops
+unexpectedly:
 ```bash
-ros2 topic echo /hazard_detection
+ros2 topic echo /hazard_detection   # shows what triggered the reflex
 ```
 
 ---
 
-## 7 — Stopping the robot safely
+## 8 — Frame IDs: real robot vs simulation
 
-Publish a zero Twist at any time:
-```bash
-ros2 topic pub --once /cmd_vel geometry_msgs/msg/Twist "{}"
-```
+The `/scan` message `frame_id` differs slightly between environments.
+Your algorithm works in the laser frame directly — no changes needed.
 
-Or press the physical power button on the Create 3 base to cut motors.
+| | Real robot | Simulation |
+|--|--|--|
+| `/scan` frame_id | `rplidar_link` | `turtlebot4/rplidar_link/rplidar` |
+| `/odom` frame | `odom` | `odom` |
+| `/cmd_vel` | same | same |
 
 ---
 
-## 8 — Typical test procedure
+## 9 — Test procedure for the lab session
 
-1. Place the robot in an open area (≥ 3 m × 3 m).
-2. Start your node with conservative limits (Step 4 above).
-3. Stand 2 m in front of the robot and walk slowly toward it — it should stop
-   or turn away before reaching your legs.
-4. Test edge cases: approaching from the side, two people simultaneously,
-   one person moving away while another approaches.
-5. Once behaviour is reliable, increase `max_linear_speed` toward the default
-   0.2 m/s and reduce `obstacle_radius_scale` toward 2.0.
+1. Connect to lab WiFi, verify topics appear (Step 1–2).
+2. Run your node with conservative limits (Step 3).
+3. One person walks slowly toward the front of the robot from 3 m — the robot
+   should stop or steer away before contact.
+4. Two people approach simultaneously from different angles.
+5. One person stands still while another walks past — robot should track the
+   moving one.
+6. Once the behaviour is reliable, increase `max_linear_speed` to the default
+   0.2 m/s.
