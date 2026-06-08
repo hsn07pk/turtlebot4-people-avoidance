@@ -39,10 +39,11 @@ Three files to implement, in order:
 
 | Document | Read when |
 |----------|-----------|
-| [SETUP.md](SETUP.md) | First session — install ROS 2, clone and build the workspace |
-| [DEVELOPMENT_GUIDE.md](DEVELOPMENT_GUIDE.md) | Implementing the algorithm — data contract, equations, hints |
-| [REAL_ROBOT.md](REAL_ROBOT.md) | Lab session — connect to the TB4, run your node, tune parameters |
-| [SIMULATION.md](SIMULATION.md) | Optional — test your algorithm offline when no robot is available |
+| [SETUP.md](SETUP.md) | **Step 1** — install ROS 2, clone and build the workspace |
+| [TURTLEBOT4_GUIDE.md](TURTLEBOT4_GUIDE.md) | **Step 2** — platform intro: drive the robot, SLAM, Nav2, rosbag |
+| [DEVELOPMENT_GUIDE.md](DEVELOPMENT_GUIDE.md) | **Step 3** — implement the algorithm: data contract, equations, hints |
+| [REAL_ROBOT.md](REAL_ROBOT.md) | **Step 4** — run your node on the TB4, tune parameters, safety |
+| [SIMULATION.md](SIMULATION.md) | Optional — test offline when no robot is available |
 | [DOCKER.md](DOCKER.md) | Optional — run everything inside Docker (any OS) |
 
 ---
