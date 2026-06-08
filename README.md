@@ -52,7 +52,8 @@ Three files to implement, in order:
 
 **Lab session (real robot):**
 ```bash
-source ~/ros2_ws/install/setup.zsh
+source ~/ros2_ws/install/setup.zsh    # zsh  (Ubuntu 24.04 / Jazzy)
+# source ~/ros2_ws/install/setup.bash # bash (Ubuntu 22.04 / Humble)
 ros2 launch people_avoidance people_avoidance.launch.py
 ```
 

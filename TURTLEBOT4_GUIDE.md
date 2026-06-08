@@ -46,16 +46,27 @@ router gives more reliable ROS 2 communication than WiFi-only.
 
 ### Configure ROS 2 on your laptop
 
-Add the following to `~/.zshrc` (once, see [SETUP.md](SETUP.md)):
+Add the following to your shell configuration file (see [SETUP.md](SETUP.md)):
 
+**zsh** (`~/.zshrc`):
 ```bash
-source /opt/ros/jazzy/setup.zsh
+source /opt/ros/jazzy/setup.zsh     # Ubuntu 24.04
+# source /opt/ros/humble/setup.zsh  # Ubuntu 22.04
 source ~/ros2_ws/install/setup.zsh 2>/dev/null || true
 export ROS_DOMAIN_ID=0                     # must match the robot — ask your instructor
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp # use the same middleware as the TB4
 ```
 
-Reload: `source ~/.zshrc`
+**bash** (`~/.bashrc`):
+```bash
+source /opt/ros/jazzy/setup.bash    # Ubuntu 24.04
+# source /opt/ros/humble/setup.bash # Ubuntu 22.04
+source ~/ros2_ws/install/setup.bash 2>/dev/null || true
+export ROS_DOMAIN_ID=0
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+```
+
+Reload: `source ~/.zshrc` or `source ~/.bashrc`
 
 ### Verify the connection
 

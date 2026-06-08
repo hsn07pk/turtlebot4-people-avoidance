@@ -4,13 +4,15 @@ One-time setup on your laptop.  Takes about 20 minutes on a fresh Ubuntu install
 
 ---
 
-## Requirements
+## Supported configurations
 
-| | |
-|--|--|
-| OS | Ubuntu 24.04 LTS (Noble), 64-bit |
-| RAM | 8 GB minimum |
-| Disk | 5 GB free |
+| Ubuntu | ROS 2 distro | Status |
+|--------|-------------|--------|
+| 24.04 LTS (Noble) | **Jazzy Jalisco** | Recommended — LTS, supported until 2029 |
+| 22.04 LTS (Jammy) | **Humble Hawksbill** | Supported — LTS, supported until 2027 |
+
+Choose the row that matches your Ubuntu version.  All commands below show
+both variants; substitute the one that applies to you.
 
 > **Conda users** — conda intercepts Python and breaks ROS 2 tools.  
 > Run `conda deactivate` at the start of every terminal used for ROS work.
@@ -35,40 +37,82 @@ sudo apt update
 
 ---
 
-## 2 — Install ROS 2 Jazzy
+## 2 — Install ROS 2
 
+**Ubuntu 24.04 — Jazzy:**
 ```bash
 sudo apt install -y ros-jazzy-desktop python3-colcon-common-extensions
+```
+
+**Ubuntu 22.04 — Humble:**
+```bash
+sudo apt install -y ros-humble-desktop python3-colcon-common-extensions
 ```
 
 ---
 
 ## 3 — Configure your shell
 
-Add to `~/.zshrc` (or `~/.bashrc` — replace `setup.zsh` with `setup.bash`):
+Add the following lines to your shell configuration file and then reload it.
 
+**zsh** (`~/.zshrc`):
 ```bash
-source /opt/ros/jazzy/setup.zsh
+# ROS 2 — pick the line matching your Ubuntu version
+source /opt/ros/jazzy/setup.zsh     # Ubuntu 24.04
+# source /opt/ros/humble/setup.zsh  # Ubuntu 22.04
+
 source ~/ros2_ws/install/setup.zsh 2>/dev/null || true
-export ROS_DOMAIN_ID=0        # must match the robot — your instructor will tell you the value
+export ROS_DOMAIN_ID=0              # must match the robot — your instructor will tell you
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 ```
 
-Reload: `source ~/.zshrc`
+```bash
+source ~/.zshrc
+```
+
+**bash** (`~/.bashrc`):
+```bash
+# ROS 2 — pick the line matching your Ubuntu version
+source /opt/ros/jazzy/setup.bash    # Ubuntu 24.04
+# source /opt/ros/humble/setup.bash # Ubuntu 22.04
+
+source ~/ros2_ws/install/setup.bash 2>/dev/null || true
+export ROS_DOMAIN_ID=0
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+```
+
+```bash
+source ~/.bashrc
+```
+
+**Verify:**
+```bash
+echo $ROS_DISTRO    # jazzy  or  humble
+```
 
 ---
 
 ## 4 — Clone and build the workspace
 
 ```bash
-git clone https://gitlab.example.com/course/people_avoidance.git ros2_ws
+git clone https://version.aalto.fi/kucnert1/ubiss_2026.git ros2_ws
 cd ros2_ws
 conda deactivate
 colcon build --symlink-install
-source install/setup.zsh
 ```
 
-`--symlink-install` links Python source files in-place so you can edit code
-and re-run without rebuilding.
+Source the workspace:
+
+```bash
+# zsh
+source install/setup.zsh
+
+# bash
+source install/setup.bash
+```
+
+`--symlink-install` links Python source files in-place: edit code, re-run
+immediately without rebuilding.
 
 **Verify:**
 ```bash
@@ -85,12 +129,12 @@ colcon build --packages-select people_avoidance --symlink-install
 ```
 
 You need to rebuild whenever you add a new Python import.  Simple edits to
-existing functions take effect immediately without rebuilding (symlink install).
+existing functions take effect immediately (symlink install).
 
 ---
 
 ## That's it
 
 Your workspace is ready.  Continue with:
-- [REAL_ROBOT.md](REAL_ROBOT.md) — running your code on the TurtleBot4
-- [DEVELOPMENT_GUIDE.md](DEVELOPMENT_GUIDE.md) — understanding what to implement
+- [TURTLEBOT4_GUIDE.md](TURTLEBOT4_GUIDE.md) — learn the robot platform
+- [DEVELOPMENT_GUIDE.md](DEVELOPMENT_GUIDE.md) — understand what to implement
