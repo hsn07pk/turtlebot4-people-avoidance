@@ -33,8 +33,7 @@ happened and how to recover, not on getting perfect results every time.
 
 1. Place the TurtleBot4 on its dock.  The green LED on the dock lights up
    briefly, confirming power is flowing.
-2. Wait for the boot sequence to complete (~60 s).  The robot's display will
-   show an IP address and battery level when ready.
+2. Wait for the boot sequence to complete (~60 s).
 3. If the dock LED turns red, the battery is low — wait for a full charge
    before proceeding.
 
