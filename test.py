@@ -296,6 +296,7 @@ function sceneData(d, td, maxr, vmove){
     z:legs.map(function(){return 0.04;}),
     marker:{size:4,color:'#ff6d00'},hoverinfo:'skip',showlegend:false});
 
+  var stems={x:[],y:[],z:[],c:[]};
   var boxes={x:[],y:[],z:[]};
   var rings={x:[],y:[],z:[],c:[]};
   var trail={x:[],y:[],z:[],c:[]};
@@ -309,7 +310,9 @@ function sceneData(d, td, maxr, vmove){
     if(t.conf)stats.conf++; if(t.conf&&moving)stats.move++;
     var col=tcolor(t.id);
     var op=(t.misses>0)?0.40:0.95;            // faded while coasting
-    if(stats.n<=14) data.push(person(t,col,op));
+    var scol=(t.misses>0)?'#c5c5c5':col;
+    stems.x.push(t.x,t.x,null);stems.y.push(t.y,t.y,null);stems.z.push(0,1.8,null);
+    stems.c.push(scol,scol,scol);
     pushBox(boxes,t);
     pushRing(rings,t,col);
     labx.push(t.x);laby.push(t.y);labt.push(String(t.id));labc.push(col);
@@ -323,6 +326,8 @@ function sceneData(d, td, maxr, vmove){
       px.push(null);py.push(null);pz.push(null);
     }
   });
+  data.push({type:'scatter3d',mode:'lines',x:stems.x,y:stems.y,z:stems.z,
+    line:{color:stems.c,width:8},hoverinfo:'skip',showlegend:false});
   data.push({type:'scatter3d',mode:'lines',x:trail.x,y:trail.y,z:trail.z,
     line:{color:trail.c,width:6},hoverinfo:'skip',showlegend:false});
   data.push({type:'scatter3d',mode:'lines',x:boxes.x,y:boxes.y,z:boxes.z,
