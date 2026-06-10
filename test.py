@@ -30,16 +30,17 @@ from people_avoidance.leg_detection import detect_legs, scan_to_cartesian, segme
 from people_avoidance.tracking import KalmanTracker
 
 # Live-tunable parameters (sliders write here; the scan callback reads).
+# Defaults = values tuned live in the lab (2026-06-10 session).
 params = {
-    'dt': 0.10,      # segmentation gap floor (m)
-    'lr': 0.10,      # leg radius (m)
-    'mlw': 0.25,     # max leg-pair width (m)
-    'circ': 0.15,    # circularity wall-reject
-    'minpts': 2,     # min points per cluster
-    'maxr': 8.0,     # display range filter (m)
-    'gate': 5.99,    # Mahalanobis gate chi2 (tracker)
+    'dt': 0.30,      # segmentation gap floor (m)
+    'lr': 0.20,      # leg radius (m)
+    'mlw': 0.60,     # max leg-pair width (m)
+    'circ': 0.80,    # circularity wall-reject
+    'minpts': 12,    # min points per cluster
+    'maxr': 2.0,     # display range filter (m)
+    'gate': 5.40,    # Mahalanobis gate chi2 (tracker)
     'q': 1.0,        # process noise spectral density (tracker)
-    'horizon': 2.0,  # prediction horizon (s)
+    'horizon': 3.0,  # prediction horizon (s)
     'vmove': 0.3,    # speed above which a track counts as "moving" (m/s)
 }
 
@@ -154,18 +155,18 @@ small{color:#888} .sec{margin-top:10px;border-top:1px solid #333;padding-top:6px
 <div id="panel">
 <h3>People Tracking — live</h3><small>Stage 1 detection + Stage 2 Kalman tracks</small>
 <div class="sec">DETECTION</div>
-<div class="row"><label>distance_threshold<span class="val" id="vdt"></span></label><input type=range id=dt min=0.02 max=0.30 step=0.005 value=0.10></div>
-<div class="row"><label>leg_radius<span class="val" id="vlr"></span></label><input type=range id=lr min=0.03 max=0.20 step=0.005 value=0.10></div>
-<div class="row"><label>max_leg_width<span class="val" id="vmlw"></span></label><input type=range id=mlw min=0.10 max=0.60 step=0.01 value=0.25></div>
-<div class="row"><label>circularity_min<span class="val" id="vcirc"></span></label><input type=range id=circ min=0 max=0.80 step=0.01 value=0.15></div>
-<div class="row"><label>min_points<span class="val" id="vminpts"></span></label><input type=range id=minpts min=2 max=12 step=1 value=2></div>
+<div class="row"><label>distance_threshold<span class="val" id="vdt"></span></label><input type=range id=dt min=0.02 max=0.50 step=0.005 value=0.30></div>
+<div class="row"><label>leg_radius<span class="val" id="vlr"></span></label><input type=range id=lr min=0.03 max=0.35 step=0.005 value=0.20></div>
+<div class="row"><label>max_leg_width<span class="val" id="vmlw"></span></label><input type=range id=mlw min=0.10 max=0.90 step=0.01 value=0.60></div>
+<div class="row"><label>circularity_min<span class="val" id="vcirc"></span></label><input type=range id=circ min=0 max=0.95 step=0.01 value=0.80></div>
+<div class="row"><label>min_points<span class="val" id="vminpts"></span></label><input type=range id=minpts min=2 max=25 step=1 value=12></div>
 <div class="sec">TRACKING (Kalman)</div>
-<div class="row"><label>gate χ² (Mahalanobis)<span class="val" id="vgate"></span></label><input type=range id=gate min=2 max=15 step=0.1 value=5.99></div>
+<div class="row"><label>gate χ² (Mahalanobis)<span class="val" id="vgate"></span></label><input type=range id=gate min=2 max=15 step=0.1 value=5.4></div>
 <div class="row"><label>process noise q<span class="val" id="vq"></span></label><input type=range id=q min=0.1 max=5 step=0.1 value=1.0></div>
-<div class="row"><label>prediction horizon (s)<span class="val" id="vhorizon"></span></label><input type=range id=horizon min=0.5 max=4 step=0.5 value=2></div>
+<div class="row"><label>prediction horizon (s)<span class="val" id="vhorizon"></span></label><input type=range id=horizon min=0.5 max=4 step=0.5 value=3></div>
 <div class="row"><label>moving if speed > (m/s)<span class="val" id="vvmove"></span></label><input type=range id=vmove min=0.1 max=1.0 step=0.05 value=0.3></div>
 <div class="sec">DISPLAY</div>
-<div class="row"><label>max_range view (m)<span class="val" id="vmaxr"></span></label><input type=range id=maxr min=0.5 max=8 step=0.1 value=8></div>
+<div class="row"><label>max_range view (m)<span class="val" id="vmaxr"></span></label><input type=range id=maxr min=0.5 max=8 step=0.1 value=2></div>
 <button onclick="fetch('/reset')">Reset tracker</button>
 <div id="status"></div>
 </div>
