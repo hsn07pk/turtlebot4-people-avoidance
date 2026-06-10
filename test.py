@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
-Live people-tracking 3D visualizer + tuner (Stage 1 + Stage 2).
+Live people-tracking 3D visualizer + tuner (Stage 1 + both Stage 2 trackers).
 
-A tiny web server (built-in libs only) serves a 3D room map; open it in a
-browser on the same network. The full pipeline runs on every /scan:
+Runs the full pipeline on every /scan with TWO trackers in parallel on the
+same detections:
 
-    detect_legs()  ->  KalmanTracker.update()  ->  predict_ahead()
+    Tracking 1 — tracking.py    : Hungarian assignment + lifecycle
+                                  (gate 99 %, confirm/prune/merge)
+    Tracking 2 — tracking_2.py  : greedy NN from the course notebook
+                                  (gate 95 %, coast, measurement birth)
 
-Display: scan points coloured by cluster, leg detections in red, Kalman
-tracks as labelled columns (orange = moving person, blue = static), velocity
-arrows, and a dashed "ghost" trail showing each moving track's predicted
-future positions (Kalman prediction iterated over the chosen horizon).
-Sliders retune detection and tracking parameters live.
+The UI offers three views: Tracking 1 full page, Tracking 2 full page, or
+both side by side — pick with the radio buttons.  Sliders retune live;
+defaults are the values tuned in the lab (2026-06-10 session).
 """
 import json
 import math
@@ -28,6 +29,7 @@ from sensor_msgs.msg import LaserScan
 import people_avoidance.leg_detection as legmod
 from people_avoidance.leg_detection import detect_legs, scan_to_cartesian, segment_scan
 from people_avoidance.tracking import KalmanTracker
+from people_avoidance.tracking_2 import GreedyNNTracker
 
 # Live-tunable parameters (sliders write here; the scan callback reads).
 # Defaults = values tuned live in the lab (2026-06-10 session).
@@ -38,42 +40,66 @@ params = {
     'circ': 0.80,    # circularity wall-reject
     'minpts': 12,    # min points per cluster
     'maxr': 2.0,     # display range filter (m)
-    'gate': 5.40,    # Mahalanobis gate chi2 (tracker)
-    'q': 1.0,        # process noise spectral density (tracker)
+    'gate': 5.40,    # Mahalanobis gate chi2 (tracking 1 only; T2 fixed 5.99)
+    'q': 1.0,        # process noise spectral density (both trackers)
     'horizon': 3.0,  # prediction horizon (s)
     'vmove': 0.3,    # speed above which a track counts as "moving" (m/s)
 }
 
 state = {
-    'snapshot': {'points': [], 'legs': [], 'tracks': [], 'preds': {},
-                 'nseg': 0, 'ndet': 0, 'nscan': 0, 'dt_est': 0.0},
-    'tracker': None,
+    'snapshot': {'points': [], 'legs': [], 'nseg': 0, 'ndet': 0, 'nscan': 0,
+                 'dt_est': 0.0,
+                 't1': {'tracks': [], 'preds': {}},
+                 't2': {'tracks': [], 'preds': {}}},
+    'tracker1': None,
+    'tracker2': None,
     'last_stamp': None,
     'dt_est': 0.13,
 }
+
+WIENER_Q = lambda q, dt: q * np.array(
+    [[dt**3/3, 0, dt**2/2, 0],
+     [0, dt**3/3, 0, dt**2/2],
+     [dt**2/2, 0, dt, 0],
+     [0, dt**2/2, 0, dt]])
 
 
 def _stamp_seconds(scan):
     return scan.header.stamp.sec + scan.header.stamp.nanosec * 1e-9
 
 
-def _ensure_tracker():
-    """(Re)create the tracker when missing; live-retune gate/Q otherwise."""
-    tr = state['tracker']
-    if tr is None:
-        tr = KalmanTracker(dt=state['dt_est'],
+def _ensure_trackers():
+    """(Re)create both trackers when missing; live-retune gate/Q otherwise."""
+    t1, t2 = state['tracker1'], state['tracker2']
+    if t1 is None:
+        t1 = KalmanTracker(dt=state['dt_est'],
                            process_noise_density=params['q'],
                            gate_chi2=params['gate'])
-        state['tracker'] = tr
-        return tr
-    tr.gate_chi2 = params['gate']
-    dt, qd = tr.dt, params['q']
-    tr.Q = qd * np.array(
-        [[dt**3/3, 0, dt**2/2, 0],
-         [0, dt**3/3, 0, dt**2/2],
-         [dt**2/2, 0, dt, 0],
-         [0, dt**2/2, 0, dt]])
-    return tr
+        state['tracker1'] = t1
+    if t2 is None:
+        t2 = GreedyNNTracker(dt=state['dt_est'],
+                             process_noise_density=params['q'])
+        state['tracker2'] = t2
+    t1.gate_chi2 = params['gate']                 # T2 keeps its 95 % gate
+    t1.Q = WIENER_Q(params['q'], t1.dt)
+    t2.Q = WIENER_Q(params['q'], t2.dt)
+    return t1, t2
+
+
+def _tracker_snapshot(tracker, horizon):
+    rows = []
+    for trk in tracker.get_tracks():
+        x, y, vx, vy = (float(v) for v in trk.m)
+        rows.append({
+            'id': trk.track_id, 'x': round(x, 3), 'y': round(y, 3),
+            'vx': round(vx, 3), 'vy': round(vy, 3),
+            'speed': round(math.hypot(vx, vy), 3),
+            'conf': trk.confirmed, 'hits': trk.hits, 'misses': trk.misses,
+        })
+    preds = {str(tid): [[round(float(r[0]), 3), round(float(r[1]), 3),
+                         round(float(r[2]), 3)] for r in arr]
+             for tid, arr in tracker.predict_ahead(horizon).items()}
+    return {'tracks': rows, 'preds': preds}
 
 
 def on_scan(scan):
@@ -94,38 +120,24 @@ def on_scan(scan):
     dets = detect_legs(scan, distance_threshold=params['dt'],
                        leg_radius=params['lr'], max_leg_width=params['mlw'])
 
-    tracker = _ensure_tracker()
-    tracker.update(dets)
-    preds = tracker.predict_ahead(params['horizon'])
+    t1, t2 = _ensure_trackers()
+    t1.update(dets)
+    t2.update(dets)
 
     point_rows, sid = [], 0
     for seg in segs:
         for q in seg:
             point_rows.append([round(float(q[0]), 3), round(float(q[1]), 3), sid])
         sid += 1
-
     leg_rows = [[round(m.x, 3), round(m.y, 3),
                  round(math.hypot(m.x, m.y), 3)] for m in dets]
 
-    track_rows = []
-    for trk in tracker.get_tracks():
-        x, y, vx, vy = (float(v) for v in trk.m)
-        track_rows.append({
-            'id': trk.track_id, 'x': round(x, 3), 'y': round(y, 3),
-            'vx': round(vx, 3), 'vy': round(vy, 3),
-            'speed': round(math.hypot(vx, vy), 3),
-            'conf': trk.confirmed, 'hits': trk.hits, 'misses': trk.misses,
-        })
-
-    pred_rows = {str(tid): [[round(float(r[0]), 3), round(float(r[1]), 3),
-                             round(float(r[2]), 3)] for r in arr]
-                 for tid, arr in preds.items()}
-
     nscan = state['snapshot']['nscan'] + 1
     state['snapshot'] = {
-        'points': point_rows, 'legs': leg_rows, 'tracks': track_rows,
-        'preds': pred_rows, 'nseg': sid, 'ndet': len(dets),
+        'points': point_rows, 'legs': leg_rows, 'nseg': sid, 'ndet': len(dets),
         'nscan': nscan, 'dt_est': round(state['dt_est'], 3),
+        't1': _tracker_snapshot(t1, params['horizon']),
+        't2': _tracker_snapshot(t2, params['horizon']),
     }
 
 
@@ -137,69 +149,99 @@ class ScanNode(Node):
         self.create_subscription(LaserScan, '/scan', on_scan, qos)
 
 
-HTML = """<!doctype html><html><head><meta charset="utf-8"><title>People Tracking 3D</title>
+HTML = """<!doctype html><html><head><meta charset="utf-8"><title>People Tracking 3D — T1 vs T2</title>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
 body{margin:0;font-family:sans-serif;background:#0e0e0e;color:#eee;display:flex}
-#plot{flex:1;height:100vh}
+#plots{flex:1;display:flex;height:100vh}
+.wrap{position:relative;flex:1;min-width:0}
+.wrap .plab{position:absolute;top:8px;left:12px;z-index:5;font-size:13px;color:#ddd;
+  background:#000a;padding:3px 10px;border-radius:4px;pointer-events:none}
+.plotdiv{width:100%;height:100vh}
 #panel{width:330px;padding:14px;background:#1a1a1a;overflow:auto;box-sizing:border-box}
 h3{margin:0 0 4px} .row{margin:9px 0}
 label{display:block;font-size:12px;margin-bottom:3px}
 input[type=range]{width:100%} .val{color:#4cf;float:right}
 #status{margin-top:12px;font-size:13px;line-height:1.7;border-top:1px solid #333;padding-top:8px}
-.red{color:#ff5252}.org{color:#ffa726}.blu{color:#64b5f6}
+.red{color:#ff5252}.org{color:#ffa726}.blu{color:#64b5f6}.grn{color:#69f0ae}
 button{margin-top:10px;width:100%;padding:6px;background:#333;color:#eee;border:1px solid #555;cursor:pointer}
 small{color:#888} .sec{margin-top:10px;border-top:1px solid #333;padding-top:6px;font-size:12px;color:#aaa}
+.modes{display:flex;gap:4px;margin:8px 0}
+.modes button{margin:0;flex:1;font-size:11px;padding:6px 2px}
+.modes button.on{background:#2962ff;border-color:#2962ff}
 </style></head><body>
-<div id="plot"></div>
+<div id="plots">
+ <div class="wrap" id="wrap1"><div class="plab">Tracking 1 — Hungarian + lifecycle (tracking.py)</div><div id="plot1" class="plotdiv"></div></div>
+ <div class="wrap" id="wrap2"><div class="plab">Tracking 2 — Greedy NN, notebook approach (tracking_2.py)</div><div id="plot2" class="plotdiv"></div></div>
+</div>
 <div id="panel">
-<h3>People Tracking — live</h3><small>Stage 1 detection + Stage 2 Kalman tracks</small>
+<h3>People Tracking — live</h3><small>Stage 1 detection + two Stage 2 trackers</small>
+<div class="sec">VIEW</div>
+<div class="modes">
+ <button id="m1" onclick="setMode(1)">Tracking 1</button>
+ <button id="m2" onclick="setMode(2)">Tracking 2</button>
+ <button id="m3" onclick="setMode(3)">Side by side</button>
+</div>
 <div class="sec">DETECTION</div>
 <div class="row"><label>distance_threshold<span class="val" id="vdt"></span></label><input type=range id=dt min=0.02 max=0.50 step=0.005 value=0.30></div>
 <div class="row"><label>leg_radius<span class="val" id="vlr"></span></label><input type=range id=lr min=0.03 max=0.35 step=0.005 value=0.20></div>
 <div class="row"><label>max_leg_width<span class="val" id="vmlw"></span></label><input type=range id=mlw min=0.10 max=0.90 step=0.01 value=0.60></div>
 <div class="row"><label>circularity_min<span class="val" id="vcirc"></span></label><input type=range id=circ min=0 max=0.95 step=0.01 value=0.80></div>
 <div class="row"><label>min_points<span class="val" id="vminpts"></span></label><input type=range id=minpts min=2 max=25 step=1 value=12></div>
-<div class="sec">TRACKING (Kalman)</div>
-<div class="row"><label>gate χ² (Mahalanobis)<span class="val" id="vgate"></span></label><input type=range id=gate min=2 max=15 step=0.1 value=5.4></div>
-<div class="row"><label>process noise q<span class="val" id="vq"></span></label><input type=range id=q min=0.1 max=5 step=0.1 value=1.0></div>
+<div class="sec">TRACKING</div>
+<div class="row"><label>gate χ² — Tracking 1 only<span class="val" id="vgate"></span></label><input type=range id=gate min=2 max=15 step=0.1 value=5.4></div>
+<div class="row"><small>Tracking 2 gate is fixed at χ²₂(95%) = 5.99 (notebook)</small></div>
+<div class="row"><label>process noise q (both)<span class="val" id="vq"></span></label><input type=range id=q min=0.1 max=5 step=0.1 value=1.0></div>
 <div class="row"><label>prediction horizon (s)<span class="val" id="vhorizon"></span></label><input type=range id=horizon min=0.5 max=4 step=0.5 value=3></div>
 <div class="row"><label>moving if speed > (m/s)<span class="val" id="vvmove"></span></label><input type=range id=vmove min=0.1 max=1.0 step=0.05 value=0.3></div>
 <div class="sec">DISPLAY</div>
 <div class="row"><label>max_range view (m)<span class="val" id="vmaxr"></span></label><input type=range id=maxr min=0.5 max=8 step=0.1 value=2></div>
-<button onclick="fetch('/reset')">Reset tracker</button>
+<button onclick="fetch('/reset')">Reset both trackers</button>
 <div id="status"></div>
 </div>
 <script>
 var ids=['dt','lr','mlw','circ','minpts','maxr','gate','q','horizon','vmove'];
 function vals(){var o={};ids.forEach(function(i){o[i]=document.getElementById(i).value;document.getElementById('v'+i).textContent=parseFloat(o[i]).toFixed(i=='minpts'?0:2);});return o;}
 ids.forEach(function(i){document.getElementById(i).addEventListener('input',vals);});
-var layout={paper_bgcolor:'#0e0e0e',scene:{xaxis:{title:'x fwd (m)',color:'#888',range:[-6,6]},yaxis:{title:'y left (m)',color:'#888',range:[-6,6]},zaxis:{title:'z (m)',color:'#888',range:[0,2]},aspectmode:'manual',aspectratio:{x:1,y:1,z:0.35},bgcolor:'#0e0e0e'},margin:{l:0,r:0,t:0,b:0},showlegend:true,legend:{font:{color:'#eee'},x:0,y:1}};
-var inited=false;
-function tick(){
- var v=vals();var qs=ids.map(function(i){return i+'='+v[i];}).join('&');
- fetch('/data?'+qs).then(function(r){return r.json();}).then(function(d){
-  var maxr=parseFloat(v.maxr), vmove=parseFloat(v.vmove);
+var mode=3;
+function setMode(m){
+ mode=m;
+ document.getElementById('wrap1').style.display=(m==1||m==3)?'block':'none';
+ document.getElementById('wrap2').style.display=(m==2||m==3)?'block':'none';
+ ['m1','m2','m3'].forEach(function(b,i){document.getElementById(b).className=(i+1==m)?'on':'';});
+ setTimeout(function(){
+   if(m==1||m==3) Plotly.Plots.resize('plot1');
+   if(m==2||m==3) Plotly.Plots.resize('plot2');
+ },60);
+}
+// uirevision keeps the user's zoom/rotation across live data updates; the
+// per-plot layout objects persist so Plotly stores each camera into them.
+var mkLayout=function(){return {paper_bgcolor:'#0e0e0e',uirevision:'keep',
+ scene:{uirevision:'keep',xaxis:{title:'x fwd (m)',color:'#888',range:[-6,6]},yaxis:{title:'y left (m)',color:'#888',range:[-6,6]},zaxis:{title:'z (m)',color:'#888',range:[0,2]},aspectmode:'manual',aspectratio:{x:1,y:1,z:0.35},bgcolor:'#0e0e0e'},margin:{l:0,r:0,t:0,b:0},showlegend:true,legend:{font:{color:'#eee',size:10},x:0,y:0}};};
+var layouts={1:mkLayout(),2:mkLayout()};
+var inited={1:false,2:false};
+function sceneData(d, td, maxr, vmove){
   var pts={type:'scatter3d',mode:'markers',name:'objects ('+d.nseg+')',
     x:d.points.map(function(p){return p[0];}),y:d.points.map(function(p){return p[1];}),z:d.points.map(function(){return 0;}),
     marker:{size:2.2,color:d.points.map(function(p){return p[2];}),colorscale:'Rainbow',opacity:0.75}};
   var legs=d.legs.filter(function(l){return l[2]<=maxr;});
-  var legT={type:'scatter3d',mode:'markers',name:'detections (red)',
+  var legT={type:'scatter3d',mode:'markers',name:'detections',
     x:legs.map(function(l){return l[0];}),y:legs.map(function(l){return l[1];}),z:legs.map(function(){return 0.05;}),
     marker:{size:4.5,color:'#ff2222'}};
   var tx=[],ty=[],tz=[],tcol=[],labx=[],laby=[],labt=[],labc=[];
   var ax=[],ay=[],az=[];var px=[],py=[],pz=[];
-  var nconf=0,nmove=0;
-  d.tracks.forEach(function(t){
+  var stats={n:0,conf:0,move:0};
+  td.tracks.forEach(function(t){
     var r=Math.hypot(t.x,t.y); if(r>maxr) return;
+    stats.n++;
     var moving=t.speed>vmove;
-    if(t.conf)nconf++; if(t.conf&&moving)nmove++;
+    if(t.conf)stats.conf++; if(t.conf&&moving)stats.move++;
     var col=t.conf?(moving?'#ffa726':'#64b5f6'):'#777777';
     tx.push(t.x,t.x,null);ty.push(t.y,t.y,null);tz.push(0,1.7,null);tcol.push(col,col,col);
     labx.push(t.x);laby.push(t.y);labt.push('#'+t.id+(moving?' '+t.speed.toFixed(1)+'m/s':''));labc.push(col);
     if(t.conf&&moving){
       ax.push(t.x,t.x+t.vx,null);ay.push(t.y,t.y+t.vy,null);az.push(0.9,0.9,null);
-      var pr=d.preds[String(t.id)]||[];
+      var pr=td.preds[String(t.id)]||[];
       pr.forEach(function(p){px.push(p[0]);py.push(p[1]);pz.push(0.9);});
       px.push(null);py.push(null);pz.push(null);
     }
@@ -208,19 +250,34 @@ function tick(){
   var heads={type:'scatter3d',mode:'markers+text',showlegend:false,x:labx,y:laby,z:labx.map(function(){return 1.85;}),
     marker:{size:5,color:labc},text:labt,textfont:{color:'#eee',size:11},textposition:'top center'};
   var arrows={type:'scatter3d',mode:'lines',name:'velocity (1s)',x:ax,y:ay,z:az,line:{color:'#ffee58',width:5},hoverinfo:'skip'};
-  var ghost={type:'scatter3d',mode:'markers',name:'prediction ghosts',x:px,y:py,z:pz,
+  var ghost={type:'scatter3d',mode:'markers',name:'prediction',x:px,y:py,z:pz,
     marker:{size:3,color:'#ff8a65',opacity:0.55},hoverinfo:'skip'};
   var robot={type:'scatter3d',mode:'markers',name:'robot',x:[0],y:[0],z:[0],marker:{size:7,color:'#33ff88',symbol:'diamond'}};
-  var data=[pts,legT,stems,heads,arrows,ghost,robot];
-  if(!inited){Plotly.newPlot('plot',data,layout,{responsive:true});inited=true;}else{Plotly.react('plot',data,layout);}
-  document.getElementById('status').innerHTML=
-    'scans: '+d.nscan+'  (dt≈'+d.dt_est+'s)<br>clusters: '+d.nseg+'<br>'+
-    '<span class="red">detections: '+d.ndet+'</span><br>'+
-    'tracks: '+d.tracks.length+' — <span class="blu">confirmed: '+nconf+'</span>, '+
-    '<span class="org">moving: '+nmove+'</span>';
+  return {data:[pts,legT,stems,heads,arrows,ghost,robot],stats:stats};
+}
+function render(divId, n, d, td, maxr, vmove){
+  var s=sceneData(d, td, maxr, vmove);
+  if(!inited[n]){Plotly.newPlot(divId,s.data,layouts[n],{responsive:true});inited[n]=true;}
+  else{Plotly.react(divId,s.data,layouts[n]);}
+  return s.stats;
+}
+function tick(){
+ var v=vals();var qs=ids.map(function(i){return i+'='+v[i];}).join('&');
+ fetch('/data?'+qs).then(function(r){return r.json();}).then(function(d){
+  var maxr=parseFloat(v.maxr), vmove=parseFloat(v.vmove);
+  var s1=null,s2=null;
+  if(mode==1||mode==3) s1=render('plot1',1,d,d.t1,maxr,vmove);
+  if(mode==2||mode==3) s2=render('plot2',2,d,d.t2,maxr,vmove);
+  var h='scans: '+d.nscan+'  (dt≈'+d.dt_est+'s)<br>clusters: '+d.nseg+
+        '  <span class="red">detections: '+d.ndet+'</span><br>';
+  h+='<span class="grn">T1</span> tracks: '+d.t1.tracks.length;
+  if(s1) h+=' — <span class="blu">conf '+s1.conf+'</span>, <span class="org">moving '+s1.move+'</span>';
+  h+='<br><span class="grn">T2</span> tracks: '+d.t2.tracks.length;
+  if(s2) h+=' — <span class="blu">in view '+s2.conf+'</span>, <span class="org">moving '+s2.move+'</span>';
+  document.getElementById('status').innerHTML=h;
  }).catch(function(){});
 }
-vals();setInterval(tick,250);
+vals();setMode(3);setInterval(tick,250);
 </script></body></html>"""
 
 
@@ -244,7 +301,8 @@ class Handler(BaseHTTPRequestHandler):
             self.end_headers()
             self.wfile.write(body)
         elif u.path == '/reset':
-            state['tracker'] = None
+            state['tracker1'] = None
+            state['tracker2'] = None
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b'ok')
@@ -260,7 +318,7 @@ def main():
     node = ScanNode()
     threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
     srv = ThreadingHTTPServer(('0.0.0.0', 8080), Handler)
-    print('Serving people-tracking 3D viewer on http://0.0.0.0:8080')
+    print('Serving dual-tracker 3D viewer on http://0.0.0.0:8080')
     srv.serve_forever()
 
 
