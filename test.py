@@ -1,18 +1,22 @@
 #!/usr/bin/env python3
 """
-Live people-tracking 3D visualizer + tuner (Stage 1 + both Stage 2 trackers).
+Live people-tracking 3D visualizer + tuner (Stage 1 + both Stage 2 trackers),
+SPENCER-style rendering (Linder & Arras, "Real-Time Multi-Modal People
+Tracking for Mobile Robots in Crowded Environments").
 
 Runs the full pipeline on every /scan with TWO trackers in parallel on the
 same detections:
 
     Tracking 1 — tracking.py    : Hungarian assignment + lifecycle
-                                  (gate 99 %, confirm/prune/merge)
     Tracking 2 — tracking_2.py  : greedy NN from the course notebook
-                                  (gate 95 %, coast, measurement birth)
 
-The UI offers three views: Tracking 1 full page, Tracking 2 full page, or
-both side by side — pick with the radio buttons.  Sliders retune live;
-defaults are the values tuned in the lab (2026-06-10 session).
+SPENCER-style scene per tracker: white world with a floor grid, a 3D
+humanoid figure per track coloured by ID (faded while coasting), gray
+wireframe person boxes, ground rings, big ID labels, and each track's
+PREVIOUS PATH drawn on the floor.  Detections are orange dots, the raw
+scan is dark points.  Velocity arrows + Kalman prediction ghosts kept.
+
+Views: Tracking 1 / Tracking 2 / side by side. Sliders retune live.
 """
 import json
 import math
@@ -30,6 +34,8 @@ import people_avoidance.leg_detection as legmod
 from people_avoidance.leg_detection import detect_legs, scan_to_cartesian, segment_scan
 from people_avoidance.tracking import KalmanTracker
 from people_avoidance.tracking_2 import GreedyNNTracker
+
+TRAIL_LEN = 160          # ~20 s of path history per track at ~8 Hz
 
 # Live-tunable parameters (sliders write here; the scan callback reads).
 # Defaults = values tuned live in the lab (2026-06-10 session).
@@ -49,10 +55,11 @@ params = {
 state = {
     'snapshot': {'points': [], 'legs': [], 'nseg': 0, 'ndet': 0, 'nscan': 0,
                  'dt_est': 0.0,
-                 't1': {'tracks': [], 'preds': {}},
-                 't2': {'tracks': [], 'preds': {}}},
+                 't1': {'tracks': [], 'preds': {}, 'trails': {}},
+                 't2': {'tracks': [], 'preds': {}, 'trails': {}}},
     'tracker1': None,
     'tracker2': None,
+    'trails': {'t1': {}, 't2': {}},
     'last_stamp': None,
     'dt_est': 0.13,
 }
@@ -86,8 +93,10 @@ def _ensure_trackers():
     return t1, t2
 
 
-def _tracker_snapshot(tracker, horizon):
-    rows = []
+def _tracker_snapshot(key, tracker, horizon):
+    """Track rows + predictions + per-track path history (SPENCER trails)."""
+    trails = state['trails'][key]
+    rows, live = [], {}
     for trk in tracker.get_tracks():
         x, y, vx, vy = (float(v) for v in trk.m)
         rows.append({
@@ -96,10 +105,15 @@ def _tracker_snapshot(tracker, horizon):
             'speed': round(math.hypot(vx, vy), 3),
             'conf': trk.confirmed, 'hits': trk.hits, 'misses': trk.misses,
         })
+        hist = trails.get(trk.track_id, [])
+        hist.append((round(x, 2), round(y, 2)))
+        live[trk.track_id] = hist[-TRAIL_LEN:]
+    state['trails'][key] = live                  # paths of dead tracks vanish
     preds = {str(tid): [[round(float(r[0]), 3), round(float(r[1]), 3),
                          round(float(r[2]), 3)] for r in arr]
              for tid, arr in tracker.predict_ahead(horizon).items()}
-    return {'tracks': rows, 'preds': preds}
+    trails_out = {str(tid): hist[::2] for tid, hist in live.items()}
+    return {'tracks': rows, 'preds': preds, 'trails': trails_out}
 
 
 def on_scan(scan):
@@ -136,8 +150,8 @@ def on_scan(scan):
     state['snapshot'] = {
         'points': point_rows, 'legs': leg_rows, 'nseg': sid, 'ndet': len(dets),
         'nscan': nscan, 'dt_est': round(state['dt_est'], 3),
-        't1': _tracker_snapshot(t1, params['horizon']),
-        't2': _tracker_snapshot(t2, params['horizon']),
+        't1': _tracker_snapshot('t1', t1, params['horizon']),
+        't2': _tracker_snapshot('t2', t2, params['horizon']),
     }
 
 
@@ -149,14 +163,14 @@ class ScanNode(Node):
         self.create_subscription(LaserScan, '/scan', on_scan, qos)
 
 
-HTML = """<!doctype html><html><head><meta charset="utf-8"><title>People Tracking 3D — T1 vs T2</title>
+HTML = """<!doctype html><html><head><meta charset="utf-8"><title>People Tracking 3D — SPENCER style</title>
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
 <style>
 body{margin:0;font-family:sans-serif;background:#0e0e0e;color:#eee;display:flex}
-#plots{flex:1;display:flex;height:100vh}
-.wrap{position:relative;flex:1;min-width:0}
-.wrap .plab{position:absolute;top:8px;left:12px;z-index:5;font-size:13px;color:#ddd;
-  background:#000a;padding:3px 10px;border-radius:4px;pointer-events:none}
+#plots{flex:1;display:flex;height:100vh;background:#fff}
+.wrap{position:relative;flex:1;min-width:0;border-right:1px solid #ccc}
+.wrap .plab{position:absolute;top:8px;left:12px;z-index:5;font-size:13px;color:#222;
+  background:#ffffffcc;padding:3px 10px;border-radius:4px;pointer-events:none;border:1px solid #ddd}
 .plotdiv{width:100%;height:100vh}
 #panel{width:330px;padding:14px;background:#1a1a1a;overflow:auto;box-sizing:border-box}
 h3{margin:0 0 4px} .row{margin:9px 0}
@@ -171,11 +185,11 @@ small{color:#888} .sec{margin-top:10px;border-top:1px solid #333;padding-top:6px
 .modes button.on{background:#2962ff;border-color:#2962ff}
 </style></head><body>
 <div id="plots">
- <div class="wrap" id="wrap1"><div class="plab">Tracking 1 — Hungarian + lifecycle (tracking.py)</div><div id="plot1" class="plotdiv"></div></div>
- <div class="wrap" id="wrap2"><div class="plab">Tracking 2 — Greedy NN, notebook approach (tracking_2.py)</div><div id="plot2" class="plotdiv"></div></div>
+ <div class="wrap" id="wrap1"><div class="plab">Tracking 1 — Hungarian + lifecycle</div><div id="plot1" class="plotdiv"></div></div>
+ <div class="wrap" id="wrap2"><div class="plab">Tracking 2 — Greedy NN (notebook)</div><div id="plot2" class="plotdiv"></div></div>
 </div>
 <div id="panel">
-<h3>People Tracking — live</h3><small>Stage 1 detection + two Stage 2 trackers</small>
+<h3>People Tracking — live</h3><small>SPENCER-style · Stage 1 + two Stage 2 trackers</small>
 <div class="sec">VIEW</div>
 <div class="modes">
  <button id="m1" onclick="setMode(1)">Tracking 1</button>
@@ -214,46 +228,118 @@ function setMode(m){
    if(m==2||m==3) Plotly.Plots.resize('plot2');
  },60);
 }
-// uirevision keeps the user's zoom/rotation across live data updates; the
-// per-plot layout objects persist so Plotly stores each camera into them.
-var mkLayout=function(){return {paper_bgcolor:'#0e0e0e',uirevision:'keep',
- scene:{uirevision:'keep',xaxis:{title:'x fwd (m)',color:'#888',range:[-6,6]},yaxis:{title:'y left (m)',color:'#888',range:[-6,6]},zaxis:{title:'z (m)',color:'#888',range:[0,2]},aspectmode:'manual',aspectratio:{x:1,y:1,z:0.35},bgcolor:'#0e0e0e'},margin:{l:0,r:0,t:0,b:0},showlegend:true,legend:{font:{color:'#eee',size:10},x:0,y:0}};};
+// SPENCER track palette: red / blue / salmon / light blue / dark red / pink
+var PAL=['#e53935','#1e88e5','#ef9a9a','#64b5f6','#b71c1c','#f06292'];
+function tcolor(id){return PAL[((id%PAL.length)+PAL.length)%PAL.length];}
+
+// --- low-poly humanoid (lathed silhouette), built once -----------------
+var RINGS=[[0.00,0.05],[0.06,0.085],[0.50,0.095],[0.95,0.135],[1.15,0.175],
+           [1.30,0.19],[1.45,0.20],[1.52,0.085],[1.60,0.11],[1.72,0.105],[1.80,0.02]];
+var SEG=10, UX=[],UY=[],UZ=[],UI=[],UJ=[],UK=[];
+RINGS.forEach(function(rz){
+  for(var s=0;s<SEG;s++){var a=2*Math.PI*s/SEG;
+    UX.push(rz[1]*Math.cos(a));UY.push(rz[1]*Math.sin(a));UZ.push(rz[0]);}
+});
+for(var k=0;k<RINGS.length-1;k++){
+  for(var s=0;s<SEG;s++){
+    var a=k*SEG+s,b=k*SEG+(s+1)%SEG,c=(k+1)*SEG+s,d2=(k+1)*SEG+(s+1)%SEG;
+    UI.push(a,b);UJ.push(b,d2);UK.push(c,c);
+  }
+}
+function person(t,col,op){
+  return {type:'mesh3d',
+    x:UX.map(function(v){return v+t.x;}),
+    y:UY.map(function(v){return v+t.y;}),
+    z:UZ.slice(),
+    i:UI,j:UJ,k:UK,color:col,opacity:op,flatshading:false,
+    lighting:{ambient:0.6,diffuse:0.7,specular:0.15,roughness:0.6},
+    lightposition:{x:50,y:80,z:200},hoverinfo:'skip',showlegend:false};
+}
+function pushBox(o,t){ // gray wireframe person box 0.6x0.6x1.9
+  var w=0.3,h=1.9,x=t.x,y=t.y;
+  var c=[[x-w,y-w],[x+w,y-w],[x+w,y+w],[x-w,y+w]];
+  for(var i2=0;i2<4;i2++){var j2=(i2+1)%4;
+    o.x.push(c[i2][0],c[j2][0],null);o.y.push(c[i2][1],c[j2][1],null);o.z.push(0,0,null);
+    o.x.push(c[i2][0],c[j2][0],null);o.y.push(c[i2][1],c[j2][1],null);o.z.push(h,h,null);
+    o.x.push(c[i2][0],c[i2][0],null);o.y.push(c[i2][1],c[i2][1],null);o.z.push(0,h,null);
+  }
+}
+function pushRing(o,t,col){ // ground circle at the feet
+  var R=0.32,N=22;
+  for(var s=0;s<=N;s++){var a=2*Math.PI*s/N;
+    o.x.push(t.x+R*Math.cos(a));o.y.push(t.y+R*Math.sin(a));o.z.push(0.02);o.c.push(col);}
+  o.x.push(null);o.y.push(null);o.z.push(null);o.c.push(col);
+}
+
+var mkLayout=function(){return {paper_bgcolor:'#ffffff',uirevision:'keep',
+ scene:{uirevision:'keep',
+  xaxis:{range:[-6,6],showticklabels:false,title:{text:''},gridcolor:'#dcdcdc',zeroline:false,showbackground:false},
+  yaxis:{range:[-6,6],showticklabels:false,title:{text:''},gridcolor:'#dcdcdc',zeroline:false,showbackground:false},
+  zaxis:{range:[0,2.3],showticklabels:false,title:{text:''},showgrid:false,zeroline:false,showbackground:true,backgroundcolor:'#fafafa'},
+  aspectmode:'manual',aspectratio:{x:1,y:1,z:0.30},bgcolor:'#ffffff',
+  camera:{eye:{x:1.45,y:1.45,z:0.9}}},
+ margin:{l:0,r:0,t:0,b:0},showlegend:false};};
 var layouts={1:mkLayout(),2:mkLayout()};
 var inited={1:false,2:false};
+
 function sceneData(d, td, maxr, vmove){
-  var pts={type:'scatter3d',mode:'markers',name:'objects ('+d.nseg+')',
-    x:d.points.map(function(p){return p[0];}),y:d.points.map(function(p){return p[1];}),z:d.points.map(function(){return 0;}),
-    marker:{size:2.2,color:d.points.map(function(p){return p[2];}),colorscale:'Rainbow',opacity:0.75}};
+  var data=[],stats={n:0,conf:0,move:0};
+  // raw scan: dark structure points (SPENCER style)
+  data.push({type:'scatter3d',mode:'markers',
+    x:d.points.map(function(p){return p[0];}),y:d.points.map(function(p){return p[1];}),
+    z:d.points.map(function(){return 0.01;}),
+    marker:{size:1.8,color:'#3a3a3a',opacity:0.55},hoverinfo:'skip',showlegend:false});
+  // detections: orange laser dots
   var legs=d.legs.filter(function(l){return l[2]<=maxr;});
-  var legT={type:'scatter3d',mode:'markers',name:'detections',
-    x:legs.map(function(l){return l[0];}),y:legs.map(function(l){return l[1];}),z:legs.map(function(){return 0.05;}),
-    marker:{size:4.5,color:'#ff2222'}};
-  var tx=[],ty=[],tz=[],tcol=[],labx=[],laby=[],labt=[],labc=[];
+  data.push({type:'scatter3d',mode:'markers',
+    x:legs.map(function(l){return l[0];}),y:legs.map(function(l){return l[1];}),
+    z:legs.map(function(){return 0.04;}),
+    marker:{size:4,color:'#ff6d00'},hoverinfo:'skip',showlegend:false});
+
+  var boxes={x:[],y:[],z:[]};
+  var rings={x:[],y:[],z:[],c:[]};
+  var trail={x:[],y:[],z:[],c:[]};
+  var labx=[],laby=[],labt=[],labc=[];
   var ax=[],ay=[],az=[];var px=[],py=[],pz=[];
-  var stats={n:0,conf:0,move:0};
+
   td.tracks.forEach(function(t){
     var r=Math.hypot(t.x,t.y); if(r>maxr) return;
     stats.n++;
     var moving=t.speed>vmove;
     if(t.conf)stats.conf++; if(t.conf&&moving)stats.move++;
-    var col=t.conf?(moving?'#ffa726':'#64b5f6'):'#777777';
-    tx.push(t.x,t.x,null);ty.push(t.y,t.y,null);tz.push(0,1.7,null);tcol.push(col,col,col);
-    labx.push(t.x);laby.push(t.y);labt.push('#'+t.id+(moving?' '+t.speed.toFixed(1)+'m/s':''));labc.push(col);
+    var col=tcolor(t.id);
+    var op=(t.misses>0)?0.40:0.95;            // faded while coasting
+    if(stats.n<=14) data.push(person(t,col,op));
+    pushBox(boxes,t);
+    pushRing(rings,t,col);
+    labx.push(t.x);laby.push(t.y);labt.push(String(t.id));labc.push(col);
+    var tr=td.trails[String(t.id)]||[];        // previous path on the floor
+    tr.forEach(function(p){trail.x.push(p[0]);trail.y.push(p[1]);trail.z.push(0.02);trail.c.push(col);});
+    trail.x.push(null);trail.y.push(null);trail.z.push(null);trail.c.push(col);
     if(t.conf&&moving){
-      ax.push(t.x,t.x+t.vx,null);ay.push(t.y,t.y+t.vy,null);az.push(0.9,0.9,null);
+      ax.push(t.x,t.x+t.vx,null);ay.push(t.y,t.y+t.vy,null);az.push(0.95,0.95,null);
       var pr=td.preds[String(t.id)]||[];
-      pr.forEach(function(p){px.push(p[0]);py.push(p[1]);pz.push(0.9);});
+      pr.forEach(function(p){px.push(p[0]);py.push(p[1]);pz.push(0.95);});
       px.push(null);py.push(null);pz.push(null);
     }
   });
-  var stems={type:'scatter3d',mode:'lines',name:'tracks',x:tx,y:ty,z:tz,line:{color:tcol,width:7},hoverinfo:'skip'};
-  var heads={type:'scatter3d',mode:'markers+text',showlegend:false,x:labx,y:laby,z:labx.map(function(){return 1.85;}),
-    marker:{size:5,color:labc},text:labt,textfont:{color:'#eee',size:11},textposition:'top center'};
-  var arrows={type:'scatter3d',mode:'lines',name:'velocity (1s)',x:ax,y:ay,z:az,line:{color:'#ffee58',width:5},hoverinfo:'skip'};
-  var ghost={type:'scatter3d',mode:'markers',name:'prediction',x:px,y:py,z:pz,
-    marker:{size:3,color:'#ff8a65',opacity:0.55},hoverinfo:'skip'};
-  var robot={type:'scatter3d',mode:'markers',name:'robot',x:[0],y:[0],z:[0],marker:{size:7,color:'#33ff88',symbol:'diamond'}};
-  return {data:[pts,legT,stems,heads,arrows,ghost,robot],stats:stats};
+  data.push({type:'scatter3d',mode:'lines',x:trail.x,y:trail.y,z:trail.z,
+    line:{color:trail.c,width:6},hoverinfo:'skip',showlegend:false});
+  data.push({type:'scatter3d',mode:'lines',x:boxes.x,y:boxes.y,z:boxes.z,
+    line:{color:'#9e9e9e',width:2},hoverinfo:'skip',showlegend:false});
+  data.push({type:'scatter3d',mode:'lines',x:rings.x,y:rings.y,z:rings.z,
+    line:{color:rings.c,width:5},hoverinfo:'skip',showlegend:false});
+  data.push({type:'scatter3d',mode:'text',x:labx,y:laby,z:labx.map(function(){return 2.08;}),
+    text:labt,textfont:{color:labc,size:17},hoverinfo:'skip',showlegend:false});
+  data.push({type:'scatter3d',mode:'lines',x:ax,y:ay,z:az,
+    line:{color:'#fbc02d',width:5},hoverinfo:'skip',showlegend:false});
+  data.push({type:'scatter3d',mode:'markers',x:px,y:py,z:pz,
+    marker:{size:2.6,color:'#8d6e63',opacity:0.5},hoverinfo:'skip',showlegend:false});
+  // the robot at the origin
+  data.push({type:'scatter3d',mode:'markers+text',x:[0],y:[0],z:[0.1],
+    text:['ROBOT'],textfont:{color:'#1565c0',size:11},textposition:'bottom center',
+    marker:{size:9,color:'#1565c0',symbol:'square'},hoverinfo:'skip',showlegend:false});
+  return {data:data,stats:stats};
 }
 function render(divId, n, d, td, maxr, vmove){
   var s=sceneData(d, td, maxr, vmove);
@@ -303,6 +389,7 @@ class Handler(BaseHTTPRequestHandler):
         elif u.path == '/reset':
             state['tracker1'] = None
             state['tracker2'] = None
+            state['trails'] = {'t1': {}, 't2': {}}
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b'ok')
@@ -318,7 +405,7 @@ def main():
     node = ScanNode()
     threading.Thread(target=lambda: rclpy.spin(node), daemon=True).start()
     srv = ThreadingHTTPServer(('0.0.0.0', 8080), Handler)
-    print('Serving dual-tracker 3D viewer on http://0.0.0.0:8080')
+    print('Serving SPENCER-style dual-tracker viewer on http://0.0.0.0:8080')
     srv.serve_forever()
 
 
