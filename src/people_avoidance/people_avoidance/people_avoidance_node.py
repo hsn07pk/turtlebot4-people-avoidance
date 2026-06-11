@@ -71,9 +71,29 @@ _SENSOR_QOS = QoSProfile(depth=10,
                          reliability=ReliabilityPolicy.BEST_EFFORT,
                          history=HistoryPolicy.KEEP_LAST)
 
-from .leg_detection import detect_legs
+from .leg_detection import detect_legs, LegMeasurement
 from .tracking import KalmanTracker
 from .controller import compute_velocity
+
+
+def _rotate_measurements(measurements, yaw):
+    """Rotate laser-frame LegMeasurements into base_link by the lidar mount yaw.
+    The RPLidar A1 on the TurtleBot4 is mounted yaw +90° vs base_link, so the
+    detector/tracker/controller (which assume robot forward = +x) need the
+    measurements rotated, else the robot navigates and avoids 90° off."""
+    if abs(yaw) < 1e-6:
+        return measurements
+    c, s = math.cos(yaw), math.sin(yaw)
+    out = []
+    for m in measurements:
+        x = c * m.x - s * m.y
+        y = s * m.x + c * m.y
+        # rotate the 2×2 covariance: R' = Rot R Rotᵀ
+        rxx = c*c*m.Rxx - 2*c*s*m.Rxy + s*s*m.Ryy
+        ryy = s*s*m.Rxx + 2*c*s*m.Rxy + c*c*m.Ryy
+        rxy = c*s*m.Rxx + (c*c - s*s)*m.Rxy - c*s*m.Ryy
+        out.append(LegMeasurement(x=x, y=y, Rxx=rxx, Rxy=rxy, Ryy=ryy))
+    return out
 
 
 class PeopleAvoidanceNode(Node):
@@ -92,6 +112,7 @@ class PeopleAvoidanceNode(Node):
         self.declare_parameter('distance_threshold',    0.1)
         self.declare_parameter('leg_radius',            0.10)
         self.declare_parameter('max_leg_width',         0.25)
+        self.declare_parameter('laser_yaw_offset',      0.0)   # lidar mount yaw (rad)
         self.declare_parameter('max_linear_speed',      0.2)
         self.declare_parameter('max_angular_speed',     1.0)
         self.declare_parameter('obstacle_radius_scale', 2.0)
@@ -145,6 +166,8 @@ class PeopleAvoidanceNode(Node):
             leg_radius=p['leg_radius'],
             max_leg_width=p['max_leg_width'],
         )
+        # Rotate laser-frame detections into base_link (lidar mount offset).
+        measurements = _rotate_measurements(measurements, p['laser_yaw_offset'])
 
         # ── Stage 2: Kalman tracking ──────────────────────────────────────────
         self.tracker.update(measurements)
@@ -182,6 +205,7 @@ class PeopleAvoidanceNode(Node):
             'distance_threshold':    self.get_parameter('distance_threshold').value,
             'leg_radius':            self.get_parameter('leg_radius').value,
             'max_leg_width':         self.get_parameter('max_leg_width').value,
+            'laser_yaw_offset':      self.get_parameter('laser_yaw_offset').value,
             'max_linear_speed':      self.get_parameter('max_linear_speed').value,
             'max_angular_speed':     self.get_parameter('max_angular_speed').value,
             'obstacle_radius_scale': self.get_parameter('obstacle_radius_scale').value,

@@ -25,6 +25,10 @@ def generate_launch_description():
                 'distance_threshold':    0.13,   # segmentation gap (m); Leigh 0.13
                 'leg_radius':            0.06,   # single-leg radius (m); calf ~6 cm
                 'max_leg_width':         0.40,   # leg-pair separation (m); lecture d_max
+                # RPLidar A1 is mounted yaw +90° vs base_link on the TB4
+                # (measured from TF). Rotate detections so navigation/avoidance
+                # are aligned with the robot's true forward direction.
+                'laser_yaw_offset':      1.5708,
                 # ── Controller ───────────────────────────────────────────────
                 'max_linear_speed':      0.2,    # m/s
                 'max_angular_speed':     1.0,    # rad/s

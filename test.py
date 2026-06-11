@@ -33,11 +33,43 @@ from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 
 import people_avoidance.leg_detection as legmod
-from people_avoidance.leg_detection import detect_legs, scan_to_cartesian, segment_scan
+from people_avoidance.leg_detection import (
+    detect_legs, scan_to_cartesian, segment_scan, LegMeasurement)
 from people_avoidance.tracking import KalmanTracker
 from people_avoidance import controller as ctrl
 
 TRAIL_LEN = 160
+
+# The RPLidar A1 on the TurtleBot4 is mounted yaw +90° relative to base_link
+# (measured from the TF base_link→rplidar_link).  The detector/tracker/
+# controller all reason as if "robot forward = laser +x", so we must rotate
+# every laser-frame point into base_link first, or the robot navigates and
+# avoids 90° off (an obstacle in front would look like it is on the side).
+LASER_YAW = math.pi / 2.0
+_CY, _SY = math.cos(LASER_YAW), math.sin(LASER_YAW)
+
+
+def _to_base_xy(x, y):
+    """Rotate a laser-frame (x, y) into the base_link frame."""
+    return (_CY * x - _SY * y, _SY * x + _CY * y)
+
+
+def _to_base_pts(pts):
+    """Rotate an (N,2) array of laser points into base_link."""
+    if pts.shape[0] == 0:
+        return pts
+    R = np.array([[_CY, -_SY], [_SY, _CY]])
+    return pts @ R.T
+
+
+def _to_base_meas(m):
+    """Rotate a LegMeasurement (position + 2×2 covariance) into base_link."""
+    x, y = _to_base_xy(m.x, m.y)
+    R = np.array([[m.Rxx, m.Rxy], [m.Rxy, m.Ryy]])
+    Rot = np.array([[_CY, -_SY], [_SY, _CY]])
+    Rb = Rot @ R @ Rot.T
+    return LegMeasurement(x=float(x), y=float(y),
+                          Rxx=float(Rb[0, 0]), Rxy=float(Rb[0, 1]), Ryy=float(Rb[1, 1]))
 
 # Live-tunable parameters (sliders write here; the scan callback reads).
 params = {
@@ -60,6 +92,7 @@ state = {
     'tracker': None, 'trails': {}, 'last_stamp': None, 'dt_est': 0.13,
     'pose': (0.0, 0.0, 0.0), 'have_pose': False,
     'cmd_pub': None, 'mode': 'auto',
+    'latest_cmd': (0.0, 0.0),    # (v, ω) published at high rate by a timer
 }
 
 WIENER_Q = lambda q, dt: q * np.array(
@@ -100,6 +133,8 @@ def _extract_obstacles(pts, tracks, influence, person_r):
         d = math.hypot(x, y)
         if d > influence or d < 0.12:
             continue
+        if x < -0.3:                 # only forward-hemisphere obstacles matter
+            continue                 #   (robot never drives backward)
         if any(math.hypot(x-cx, y-cy) < person_r for (cx, cy) in centers):
             continue
         sec = int((math.atan2(y, x) + math.pi) / (2*math.pi) * nsec)
@@ -129,11 +164,13 @@ def on_scan(scan):
     legmod.CIRCULARITY_MIN = params['circ']
     legmod.MIN_CLUSTER_POINTS = int(params['minpts'])
 
-    pts = scan_to_cartesian(scan)
+    pts = _to_base_pts(scan_to_cartesian(scan))     # base_link frame
     segs = segment_scan(pts, distance_threshold=params['dt'],
                         angle_increment=scan.angle_increment) if pts.shape[0] else []
-    dets = detect_legs(scan, distance_threshold=params['dt'],
-                       leg_radius=params['lr'], max_leg_width=params['mlw'])
+    # detect in the laser frame, then rotate detections into base_link.
+    dets = [_to_base_meas(m) for m in
+            detect_legs(scan, distance_threshold=params['dt'],
+                        leg_radius=params['lr'], max_leg_width=params['mlw'])]
 
     tr = _ensure_tracker()
     tr.update(dets)
@@ -154,8 +191,9 @@ def on_scan(scan):
                                 obstacle_radius_scale=params['cors'],
                                 obstacle_points=obstacles)
     cv, cw = float(cmd.linear.x), float(cmd.angular.z)
-    if params['cdrive'] >= 0.5 and state['cmd_pub'] is not None:
-        state['cmd_pub'].publish(cmd)
+    # The timer (50 Hz) actually publishes — high rate so our commands win
+    # over the TB4 teleop_twist_joy_node, which floods /cmd_vel with zeros.
+    state['latest_cmd'] = (cv, cw)
 
     # goal in robot frame (for drawing)
     goal_robot = None
@@ -213,6 +251,14 @@ class PipeNode(Node):
         self.create_subscription(LaserScan, '/scan', on_scan, qos)
         self.create_subscription(Odometry, '/odom', on_odom, qos)
         state['cmd_pub'] = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.create_timer(0.02, self._drive_timer)   # 50 Hz publish loop
+
+    def _drive_timer(self):
+        if params['cdrive'] < 0.5 or state['cmd_pub'] is None:
+            return
+        v, w = state['latest_cmd']
+        tw = Twist(); tw.linear.x = float(v); tw.angular.z = float(w)
+        state['cmd_pub'].publish(tw)
 
 
 # tooltip text for every config
@@ -243,18 +289,35 @@ TIP = {
  'cvortex': 'Vortex (tangential) ratio: higher makes the robot circle AROUND obstacles rather than back away (smoother routing).',
 }
 
+# (key, full display name, min, max, step)
 SLIDERS = [
- ('DETECTION', [
-   ('dt', 0.02, 0.50, 0.005), ('lr', 0.03, 0.35, 0.005), ('mlw', 0.10, 0.90, 0.01),
-   ('circ', 0, 0.95, 0.01), ('minpts', 2, 25, 1), ('maxr', 0.5, 8, 0.1)]),
- ('TRACKING', [
-   ('gate', 2, 15, 0.1), ('q', 0.1, 5, 0.1), ('horizon', 0.5, 4, 0.5), ('vmove', 0.1, 1.0, 0.05)]),
- ('CONTROL', [
-   ('cmaxv', 0, 0.5, 0.01), ('cmaxw', 0, 2.0, 0.05), ('clook', 0.1, 0.6, 0.01),
-   ('cgamma', 0.3, 8, 0.1), ('cwom', 0.02, 1.0, 0.02), ('cpr', 0.1, 0.6, 0.02),
-   ('cwr', 0.0, 0.3, 0.01), ('crr', 0.1, 0.4, 0.01), ('cinf', 1.0, 5.0, 0.1),
-   ('cors', 0.0, 4.0, 0.1), ('ctpred', 0.0, 1.0, 0.05),
-   ('catt', 0.2, 3.0, 0.1), ('crep', 0.0, 2.0, 0.1), ('cvortex', 0.0, 3.0, 0.1)]),
+ ('STAGE 1 — LEG DETECTION', [
+   ('dt', 'Segmentation distance threshold (m)', 0.02, 0.50, 0.005),
+   ('lr', 'Leg radius (m)', 0.03, 0.35, 0.005),
+   ('mlw', 'Max leg-pair width (m)', 0.10, 0.90, 0.01),
+   ('circ', 'Circularity wall-reject', 0, 0.95, 0.01),
+   ('minpts', 'Min points per cluster', 2, 25, 1),
+   ('maxr', 'Max display range (m)', 0.5, 8, 0.1)]),
+ ('STAGE 2 — KALMAN TRACKING', [
+   ('gate', 'Mahalanobis gate (χ²)', 2, 15, 0.1),
+   ('q', 'Process noise density q', 0.1, 5, 0.1),
+   ('horizon', 'Prediction horizon (s)', 0.5, 4, 0.5),
+   ('vmove', 'Moving-speed threshold (m/s)', 0.1, 1.0, 0.05)]),
+ ('STAGE 3 — CONTROL (CBF + potential field)', [
+   ('cmaxv', 'Max linear speed (m/s)', 0, 0.5, 0.01),
+   ('cmaxw', 'Max angular speed (rad/s)', 0, 2.0, 0.05),
+   ('clook', 'CBF lookahead distance L (m)', 0.1, 0.6, 0.01),
+   ('cgamma', 'CBF class-K gain γ', 0.3, 8, 0.1),
+   ('cwom', 'QP ω-weight (steer ↔ brake)', 0.02, 1.0, 0.02),
+   ('cpr', 'Person radius (m)', 0.1, 0.6, 0.02),
+   ('cwr', 'Wall / obstacle-point radius (m)', 0.0, 0.3, 0.01),
+   ('crr', 'Robot footprint radius (m)', 0.1, 0.4, 0.01),
+   ('cinf', 'Obstacle influence radius (m)', 1.0, 5.0, 0.1),
+   ('cors', 'Obstacle uncertainty scale (σ)', 0.0, 4.0, 0.1),
+   ('ctpred', 'Barrier prediction time t_pred (s)', 0.0, 1.0, 0.05),
+   ('catt', 'Goal attraction weight', 0.2, 3.0, 0.1),
+   ('crep', 'Obstacle repulsion weight', 0.0, 2.0, 0.1),
+   ('cvortex', 'Vortex (route-around) ratio', 0.0, 3.0, 0.1)]),
 ]
 
 
@@ -262,10 +325,10 @@ def _build_sliders_html():
     out = []
     for section, items in SLIDERS:
         out.append(f'<div class="sec">{section}</div>')
-        for (k, lo, hi, st) in items:
+        for (k, name, lo, hi, st) in items:
             tip = TIP.get(k, '').replace('"', '&quot;')
             out.append(
-              f'<div class="row" title="{tip}"><label>{k}'
+              f'<div class="row" title="{tip}"><label>{name}'
               f'<span class="val" id="v{k}"></span></label>'
               f'<input type=range id={k} min={lo} max={hi} step={st} value={params[k]}></div>')
     return '\n'.join(out)
@@ -440,7 +503,7 @@ vals();setMode('auto');setInterval(tick,200);
 
 def page():
     body = HTML_HEAD + _build_sliders_html() + HTML_TAIL
-    return body.replace('__IDS__', json.dumps([k for _, items in SLIDERS for (k, _l, _h, _s) in items]))
+    return body.replace('__IDS__', json.dumps([k for _, items in SLIDERS for (k, _n, _l, _h, _s) in items]))
 
 
 class Handler(BaseHTTPRequestHandler):
