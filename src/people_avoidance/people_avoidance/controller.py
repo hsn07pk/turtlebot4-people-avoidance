@@ -51,8 +51,9 @@ _CFG = {
     'gamma': 2.0,             # CBF class-K gain γ
     'w_omega': 0.1,           # QP weight on ω  (<1 ⇒ "steer before brake")
     'person_radius': 0.30,    # physical half-width of a person (m)
-    'wall_radius': 0.08,      # half-width assigned to a scan obstacle point (m)
-    'robot_radius': 0.18,     # TurtleBot4 footprint radius (m)
+    'wall_radius': 0.03,      # margin added to a scan obstacle point (m) — small
+                              # so the robot will commit to physically-passable gaps
+    'robot_radius': 0.18,     # TurtleBot4 footprint radius (m) — the hard floor
     'goal_tolerance': 0.20,   # stop when within this distance of the goal (m)
     'k_omega': 1.5,           # heading-error gain for ω_nom
     'k_att': 1.0,             # goal attraction weight (potential field)
@@ -66,12 +67,12 @@ _CFG = {
     'escape_omega_frac': 0.6, # escape turn rate as a fraction of ω_max
     'slow_radius': 1.0,       # start slowing this far outside an obstacle (m)
     # Follow-the-gap navigation (commits to an opening instead of oscillating)
-    'gap_clear': 0.10,        # extra angular clearance added to each obstacle (m)
+    'gap_clear': 0.04,        # extra angular clearance added to each obstacle (m)
     'gap_hyst': 0.5,          # hysteresis: pull toward the last chosen heading
     'gap_min_deg': 14.0,      # ignore openings narrower than this (deg)
     # Back-off reflex: reverse out of the danger zone (e.g. a foot in front)
-    'backoff_trigger': 0.55,  # reverse when nearest front obstacle is within (m)
-    'backoff_clear': 0.85,    # stop reversing once it is beyond this (m, hysteresis)
+    'backoff_trigger': 0.38,  # reverse when nearest front obstacle is within (m)
+    'backoff_clear': 0.60,    # stop reversing once it is beyond this (m, hysteresis)
     'backoff_speed': 0.10,    # reverse speed (m/s)
     'backoff_rear_min': 0.50, # only reverse if the space behind is clearer than (m)
                               # (≈ robot radius 0.18 + a reaction margin)
