@@ -80,7 +80,8 @@ params = {
     # Stage 3 control
     'cmaxv': 0.20, 'cmaxw': 1.00, 'clook': 0.30, 'cgamma': 2.0, 'cwom': 0.10,
     'cpr': 0.30, 'cwr': 0.08, 'crr': 0.18, 'cinf': 2.5, 'cors': 2.0, 'ctpred': 0.30,
-    'catt': 1.0, 'crep': 0.6, 'cvortex': 1.6,
+    'cgapclr': 0.10, 'cgaphyst': 0.5,
+    'cbtrig': 0.55, 'cbclear': 0.85, 'cbspeed': 0.10, 'cbrear': 0.50,
     'cdrive': 0.0,
 }
 
@@ -133,8 +134,8 @@ def _extract_obstacles(pts, tracks, influence, person_r):
         d = math.hypot(x, y)
         if d > influence or d < 0.12:
             continue
-        if x < -0.3:                 # only forward-hemisphere obstacles matter
-            continue                 #   (robot never drives backward)
+        # Keep rear obstacles too — the back-off reflex needs to know whether
+        # the space behind is clear before reversing.
         if any(math.hypot(x-cx, y-cy) < person_r for (cx, cy) in centers):
             continue
         sec = int((math.atan2(y, x) + math.pi) / (2*math.pi) * nsec)
@@ -183,7 +184,9 @@ def on_scan(scan):
                     w_omega=params['cwom'], person_radius=params['cpr'],
                     wall_radius=params['cwr'], robot_radius=params['crr'],
                     influence=params['cinf'], t_pred=params['ctpred'],
-                    k_att=params['catt'], k_rep=params['crep'], vortex=params['cvortex'])
+                    gap_clear=params['cgapclr'], gap_hyst=params['cgaphyst'],
+                    backoff_trigger=params['cbtrig'], backoff_clear=params['cbclear'],
+                    backoff_speed=params['cbspeed'], backoff_rear_min=params['cbrear'])
     rx, ry, rth = state['pose']
     cmd = ctrl.compute_velocity(tracks, rx, ry, rth,
                                 max_linear_speed=params['cmaxv'],
@@ -284,9 +287,12 @@ TIP = {
  'cinf': 'Influence radius (m): obstacles farther than this are ignored by the controller.',
  'cors': 'Obstacle-radius scale k: inflates a person’s bubble by k·σ of the track position uncertainty.',
  'ctpred': 'Barrier prediction t_pred (s): advance each person by velocity·t_pred before testing the CBF (anticipate motion).',
- 'catt': 'Goal attraction weight in the potential field (how strongly it pulls toward the goal).',
- 'crep': 'Obstacle repulsion weight in the potential field (how strongly obstacles push the heading away).',
- 'cvortex': 'Vortex (tangential) ratio: higher makes the robot circle AROUND obstacles rather than back away (smoother routing).',
+ 'cgapclr': 'Follow-the-Gap extra clearance (m) added to each obstacle when searching for free openings. Higher = wider berth around obstacles.',
+ 'cgaphyst': 'Follow-the-Gap hysteresis: how strongly the robot commits to its last chosen direction. Higher = less left/right oscillation, commits harder to going around one side.',
+ 'cbtrig': 'Back-off trigger (m): reverse when the nearest front obstacle gets this close (a foot stepping in front).',
+ 'cbclear': 'Back-off clear (m): stop reversing once the obstacle is beyond this distance (hysteresis vs the trigger).',
+ 'cbspeed': 'Back-off reverse speed (m/s) when escaping the danger zone.',
+ 'cbrear': 'Back-off rear safety (m): only reverse if the space behind is clearer than this (≈ robot radius + margin).',
 }
 
 # (key, full display name, min, max, step)
@@ -315,9 +321,12 @@ SLIDERS = [
    ('cinf', 'Obstacle influence radius (m)', 1.0, 5.0, 0.1),
    ('cors', 'Obstacle uncertainty scale (σ)', 0.0, 4.0, 0.1),
    ('ctpred', 'Barrier prediction time t_pred (s)', 0.0, 1.0, 0.05),
-   ('catt', 'Goal attraction weight', 0.2, 3.0, 0.1),
-   ('crep', 'Obstacle repulsion weight', 0.0, 2.0, 0.1),
-   ('cvortex', 'Vortex (route-around) ratio', 0.0, 3.0, 0.1)]),
+   ('cgapclr', 'Follow-the-Gap clearance (m)', 0.0, 0.4, 0.01),
+   ('cgaphyst', 'Follow-the-Gap commitment (hysteresis)', 0.0, 2.0, 0.05),
+   ('cbtrig', 'Back-off trigger distance (m)', 0.2, 1.0, 0.05),
+   ('cbclear', 'Back-off clear distance (m)', 0.4, 1.5, 0.05),
+   ('cbspeed', 'Back-off reverse speed (m/s)', 0.0, 0.25, 0.01),
+   ('cbrear', 'Back-off rear safety (m)', 0.3, 1.0, 0.05)]),
 ]
 
 
@@ -387,8 +396,8 @@ HTML_TAIL = """
 <script>
 var ids=__IDS__;
 var PRESETS={
- 'research':{dt:0.13,lr:0.06,mlw:0.40,circ:0.20,minpts:3,maxr:4.0,gate:9.21,q:0.5,horizon:2.0,vmove:0.30,cmaxv:0.20,cmaxw:1.00,clook:0.30,cgamma:2.0,cwom:0.10,cpr:0.30,cwr:0.08,crr:0.18,cinf:2.5,cors:2.0,ctpred:0.30,catt:1.0,crep:0.6,cvortex:1.6},
- 'default':{dt:0.30,lr:0.20,mlw:0.60,circ:0.80,minpts:12,maxr:2.0,gate:5.40,q:1.0,horizon:3.0,vmove:0.30,cmaxv:0.20,cmaxw:1.00,clook:0.30,cgamma:2.0,cwom:0.10,cpr:0.30,cwr:0.08,crr:0.18,cinf:2.5,cors:2.0,ctpred:0.30,catt:1.0,crep:0.6,cvortex:1.6}};
+ 'research':{dt:0.13,lr:0.06,mlw:0.40,circ:0.20,minpts:3,maxr:4.0,gate:9.21,q:0.5,horizon:2.0,vmove:0.30,cmaxv:0.20,cmaxw:1.00,clook:0.30,cgamma:2.0,cwom:0.10,cpr:0.30,cwr:0.08,crr:0.18,cinf:1.5,cors:2.0,ctpred:0.30,cgapclr:0.10,cgaphyst:0.5,cbtrig:0.55,cbclear:0.85,cbspeed:0.10,cbrear:0.50},
+ 'default':{dt:0.30,lr:0.20,mlw:0.60,circ:0.80,minpts:12,maxr:2.0,gate:5.40,q:1.0,horizon:3.0,vmove:0.30,cmaxv:0.20,cmaxw:1.00,clook:0.30,cgamma:2.0,cwom:0.10,cpr:0.30,cwr:0.08,crr:0.18,cinf:2.5,cors:2.0,ctpred:0.30,cgapclr:0.10,cgaphyst:0.5,cbtrig:0.55,cbclear:0.85,cbspeed:0.10,cbrear:0.50}};
 function applyPreset(){var p=PRESETS[document.getElementById('preset').value];if(!p)return;
  ids.forEach(function(i){if(p[i]!==undefined)document.getElementById(i).value=p[i];});vals();}
 function vals(){var o={};ids.forEach(function(i){o[i]=document.getElementById(i).value;

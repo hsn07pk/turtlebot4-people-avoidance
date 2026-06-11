@@ -69,12 +69,21 @@ _CFG = {
     'gap_clear': 0.10,        # extra angular clearance added to each obstacle (m)
     'gap_hyst': 0.5,          # hysteresis: pull toward the last chosen heading
     'gap_min_deg': 14.0,      # ignore openings narrower than this (deg)
+    # Back-off reflex: reverse out of the danger zone (e.g. a foot in front)
+    'backoff_trigger': 0.55,  # reverse when nearest front obstacle is within (m)
+    'backoff_clear': 0.85,    # stop reversing once it is beyond this (m, hysteresis)
+    'backoff_speed': 0.10,    # reverse speed (m/s)
+    'backoff_rear_min': 0.50, # only reverse if the space behind is clearer than (m)
+                              # (≈ robot radius 0.18 + a reaction margin)
 }
 
 # Heading the robot last committed to (radians, robot frame).  The hysteresis
 # in _gap_heading pulls toward this so the robot does not flip-flop left/right
 # in front of an obstacle — it commits to going around one side.
 _last_heading: float = 0.0
+
+# True while the back-off reflex is reversing out of the danger zone.
+_backing: bool = False
 
 # Navigation goal in the ODOM frame.  None → drive straight forward.
 _goal_odom: Optional[Tuple[float, float]] = None
@@ -83,10 +92,11 @@ _manual_cmd: Optional[Tuple[float, float]] = None   # (v, ω) manual override ta
 
 def set_goal(x: float, y: float) -> None:
     """Set the navigation goal (odom frame)."""
-    global _goal_odom, _manual_cmd, _last_heading
+    global _goal_odom, _manual_cmd, _last_heading, _backing
     _goal_odom = (float(x), float(y))
     _manual_cmd = None
     _last_heading = 0.0          # forget the old commitment for a fresh goal
+    _backing = False
 
 
 def clear_goal() -> None:
@@ -328,6 +338,32 @@ def compute_velocity(
     cmd = Twist()
     L = _CFG['lookahead']
     obs = _gather_obstacles(tracks, obstacle_points, obstacle_radius_scale)
+
+    # ── 0. Back-off reflex ────────────────────────────────────────────────
+    # If an obstacle is in the danger zone right ahead (a foot stepping in
+    # front) and there is room behind, REVERSE out until clear — then the
+    # normal navigation below can find a way around.  Safe: we only back up
+    # while the space behind stays clearer than backoff_rear_min.
+    global _backing
+    front = [math.hypot(o['px'], o['py']) for o in obs
+             if abs(math.atan2(o['py'], o['px'])) < math.radians(75)]
+    rear = [math.hypot(o['px'], o['py']) for o in obs
+            if abs(math.atan2(o['py'], o['px'])) > math.radians(105)]
+    near_front = min(front, default=float('inf'))
+    near_rear = min(rear, default=float('inf'))
+    rear_min = _CFG['backoff_rear_min']
+    if _backing:
+        if near_front > _CFG['backoff_clear'] or near_rear < rear_min:
+            _backing = False
+    elif near_front < _CFG['backoff_trigger'] and near_rear > rear_min:
+        _backing = True
+    if _backing:
+        v = -min(_CFG['backoff_speed'], max_linear_speed)
+        if near_rear < rear_min + 0.3:                 # ease off near rear limit
+            v *= max(0.0, (near_rear - rear_min) / 0.3)
+        cmd.linear.x = float(v)
+        cmd.angular.z = 0.0                            # back straight; re-plan once clear
+        return cmd
 
     # ── 1. NOMINAL command ────────────────────────────────────────────────
     if _manual_cmd is not None:
