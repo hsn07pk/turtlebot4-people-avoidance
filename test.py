@@ -30,31 +30,48 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import LaserScan
 
+from geometry_msgs.msg import Twist
+
 import people_avoidance.leg_detection as legmod
 from people_avoidance.leg_detection import detect_legs, scan_to_cartesian, segment_scan
 from people_avoidance.tracking import KalmanTracker
 from people_avoidance.tracking_2 import GreedyNNTracker
+from people_avoidance import controller as ctrl
 
 TRAIL_LEN = 160          # ~20 s of path history per track at ~8 Hz
 
 # Live-tunable parameters (sliders write here; the scan callback reads).
 # Defaults = values tuned live in the lab (2026-06-10 session).
 params = {
+    # --- Stage 1 detection ---
     'dt': 0.30,      # segmentation gap floor (m)
     'lr': 0.20,      # leg radius (m)
     'mlw': 0.60,     # max leg-pair width (m)
     'circ': 0.80,    # circularity wall-reject
     'minpts': 12,    # min points per cluster
     'maxr': 2.0,     # display range filter (m)
+    # --- Stage 2 tracking ---
     'gate': 5.40,    # Mahalanobis gate chi2 (tracking 1 only; T2 fixed 5.99)
     'q': 1.0,        # process noise spectral density (both trackers)
     'horizon': 3.0,  # prediction horizon (s)
     'vmove': 0.3,    # speed above which a track counts as "moving" (m/s)
+    # --- Stage 3 controller (CBF-QP), run live on tracking-1 ---
+    'cmaxv': 0.20,   # max_linear_speed (m/s)
+    'cmaxw': 1.00,   # max_angular_speed (rad/s)
+    'clook': 0.30,   # CBF lookahead L (m)
+    'cgamma': 2.0,   # CBF class-K gain gamma
+    'cwom': 0.10,    # QP weight on omega (steer-before-brake)
+    'cpr': 0.30,     # person radius (m)
+    'crr': 0.18,     # robot radius (m)
+    'cinf': 3.0,     # influence radius — ignore people beyond (m)
+    'cors': 2.0,     # obstacle_radius_scale (uncertainty inflation)
+    'ctpred': 0.30,  # controller barrier prediction lookahead (s)
+    'cdrive': 0.0,   # 1 = publish /cmd_vel to the robot, 0 = preview only
 }
 
 state = {
     'snapshot': {'points': [], 'legs': [], 'nseg': 0, 'ndet': 0, 'nscan': 0,
-                 'dt_est': 0.0,
+                 'dt_est': 0.0, 'cmd': {'v': 0.0, 'w': 0.0, 'drive': False},
                  't1': {'tracks': [], 'preds': {}, 'trails': {}},
                  't2': {'tracks': [], 'preds': {}, 'trails': {}}},
     'tracker1': None,
@@ -62,6 +79,7 @@ state = {
     'trails': {'t1': {}, 't2': {}},
     'last_stamp': None,
     'dt_est': 0.13,
+    'cmd_pub': None,        # /cmd_vel publisher (set in ScanNode)
 }
 
 WIENER_Q = lambda q, dt: q * np.array(
@@ -146,12 +164,33 @@ def on_scan(scan):
     leg_rows = [[round(m.x, 3), round(m.y, 3),
                  round(math.hypot(m.x, m.y), 3)] for m in dets]
 
+    snap1 = _tracker_snapshot('t1', t1, params['horizon'])
+    snap2 = _tracker_snapshot('t2', t2, params['horizon'])
+
+    # ── Stage 3 controller, live on tracking-1's tracks ───────────────────
+    # The robot is at the origin of the laser frame, so robot pose = (0,0,0)
+    # and tracks are already robot-relative.  Drive-forward nominal (no goal)
+    # → the CBF deflects around the detected people.
+    ctrl.set_params(lookahead=params['clook'], gamma=params['cgamma'],
+                    w_omega=params['cwom'], person_radius=params['cpr'],
+                    robot_radius=params['crr'], influence=params['cinf'],
+                    t_pred=params['ctpred'])
+    ctrl.clear_goal()
+    cmd = ctrl.compute_velocity(
+        t1.get_tracks(), 0.0, 0.0, 0.0,
+        max_linear_speed=params['cmaxv'], max_angular_speed=params['cmaxw'],
+        obstacle_radius_scale=params['cors'])
+    cmd_v, cmd_w = float(cmd.linear.x), float(cmd.angular.z)
+    if params['cdrive'] >= 0.5 and state['cmd_pub'] is not None:
+        state['cmd_pub'].publish(cmd)        # actually drive the robot
+
     nscan = state['snapshot']['nscan'] + 1
     state['snapshot'] = {
         'points': point_rows, 'legs': leg_rows, 'nseg': sid, 'ndet': len(dets),
         'nscan': nscan, 'dt_est': round(state['dt_est'], 3),
-        't1': _tracker_snapshot('t1', t1, params['horizon']),
-        't2': _tracker_snapshot('t2', t2, params['horizon']),
+        't1': snap1, 't2': snap2,
+        'cmd': {'v': round(cmd_v, 3), 'w': round(cmd_w, 3),
+                'drive': params['cdrive'] >= 0.5},
     }
 
 
@@ -161,6 +200,7 @@ class ScanNode(Node):
         qos = QoSProfile(depth=10, reliability=ReliabilityPolicy.BEST_EFFORT,
                          history=HistoryPolicy.KEEP_LAST)
         self.create_subscription(LaserScan, '/scan', on_scan, qos)
+        state['cmd_pub'] = self.create_publisher(Twist, '/cmd_vel', 10)
 
 
 HTML = """<!doctype html><html><head><meta charset="utf-8"><title>People Tracking 3D — SPENCER style</title>
@@ -208,14 +248,50 @@ small{color:#888} .sec{margin-top:10px;border-top:1px solid #333;padding-top:6px
 <div class="row"><label>process noise q (both)<span class="val" id="vq"></span></label><input type=range id=q min=0.1 max=5 step=0.1 value=1.0></div>
 <div class="row"><label>prediction horizon (s)<span class="val" id="vhorizon"></span></label><input type=range id=horizon min=0.5 max=4 step=0.5 value=3></div>
 <div class="row"><label>moving if speed > (m/s)<span class="val" id="vvmove"></span></label><input type=range id=vmove min=0.1 max=1.0 step=0.05 value=0.3></div>
+<div class="sec">CONTROL — Stage 3 (CBF-QP, on Tracking 1)</div>
+<div class="row"><label>max_linear_speed (m/s)<span class="val" id="vcmaxv"></span></label><input type=range id=cmaxv min=0.0 max=0.5 step=0.01 value=0.20></div>
+<div class="row"><label>max_angular_speed (rad/s)<span class="val" id="vcmaxw"></span></label><input type=range id=cmaxw min=0.0 max=2.0 step=0.05 value=1.00></div>
+<div class="row"><label>CBF lookahead L (m)<span class="val" id="vclook"></span></label><input type=range id=clook min=0.1 max=0.6 step=0.01 value=0.30></div>
+<div class="row"><label>CBF gamma (γ)<span class="val" id="vcgamma"></span></label><input type=range id=cgamma min=0.3 max=8 step=0.1 value=2.0></div>
+<div class="row"><label>QP ω-weight (steer↔brake)<span class="val" id="vcwom"></span></label><input type=range id=cwom min=0.02 max=1.0 step=0.02 value=0.10></div>
+<div class="row"><label>person_radius (m)<span class="val" id="vcpr"></span></label><input type=range id=cpr min=0.1 max=0.6 step=0.02 value=0.30></div>
+<div class="row"><label>robot_radius (m)<span class="val" id="vcrr"></span></label><input type=range id=crr min=0.1 max=0.4 step=0.01 value=0.18></div>
+<div class="row"><label>influence radius (m)<span class="val" id="vcinf"></span></label><input type=range id=cinf min=1.0 max=5.0 step=0.1 value=3.0></div>
+<div class="row"><label>obstacle_radius_scale (σ infl.)<span class="val" id="vcors"></span></label><input type=range id=cors min=0.0 max=4.0 step=0.1 value=2.0></div>
+<div class="row"><label>barrier prediction t_pred (s)<span class="val" id="vctpred"></span></label><input type=range id=ctpred min=0.0 max=1.0 step=0.05 value=0.30></div>
+<div class="row" style="background:#3a1010;padding:6px;border-radius:4px">
+ <label><input type=checkbox id=cdrive onchange="vals()"> <b>Drive robot</b> (publish /cmd_vel)</label>
+ <small>OFF = preview only. ON = the robot actually moves to avoid people.</small></div>
 <div class="sec">DISPLAY</div>
 <div class="row"><label>max_range view (m)<span class="val" id="vmaxr"></span></label><input type=range id=maxr min=0.5 max=8 step=0.1 value=2></div>
 <button onclick="fetch('/reset')">Reset both trackers</button>
+<div class="row"><label>Config preset</label>
+<select id="preset" onchange="applyPreset()" style="width:100%;padding:6px;background:#222;color:#eee;border:1px solid #555">
+ <option value="default">default (lab-tuned)</option>
+ <option value="research">test-1-research</option>
+</select></div>
 <div id="status"></div>
 </div>
 <script>
-var ids=['dt','lr','mlw','circ','minpts','maxr','gate','q','horizon','vmove'];
-function vals(){var o={};ids.forEach(function(i){o[i]=document.getElementById(i).value;document.getElementById('v'+i).textContent=parseFloat(o[i]).toFixed(i=='minpts'?0:2);});return o;}
+var ids=['dt','lr','mlw','circ','minpts','maxr','gate','q','horizon','vmove',
+         'cmaxv','cmaxw','clook','cgamma','cwom','cpr','crr','cinf','cors','ctpred'];
+// Config presets. "default" = values tuned live in the lab. "research" =
+// literature + on-robot measured values (RPLidar A1 @0.5deg/7.7Hz, noise
+// 1-40mm by range; leg_tracker/Arras/SPENCER detector + KF tuning; SPENCER
+// 99% gate; SPENCER 0.2-0.4 m/s moving cutoff). See PRESETS.md.
+var CTRL={cmaxv:0.20,cmaxw:1.00,clook:0.30,cgamma:2.0,cwom:0.10,cpr:0.30,crr:0.18,cinf:3.0,cors:2.0,ctpred:0.30};
+function withCtrl(o){var r={};for(var k in o)r[k]=o[k];for(var k in CTRL)r[k]=CTRL[k];return r;}
+var PRESETS={
+ 'default':  withCtrl({dt:0.30, lr:0.20, mlw:0.60, circ:0.80, minpts:12, maxr:2.0, gate:5.40, q:1.0, horizon:3.0, vmove:0.30}),
+ 'research': withCtrl({dt:0.13, lr:0.06, mlw:0.45, circ:0.20, minpts:4,  maxr:4.0, gate:9.21, q:0.5, horizon:2.0, vmove:0.30})
+};
+function applyPreset(){
+ var p=PRESETS[document.getElementById('preset').value]; if(!p) return;
+ ids.forEach(function(i){ if(p[i]!==undefined){ document.getElementById(i).value=p[i]; }});
+ vals();
+}
+function vals(){var o={};ids.forEach(function(i){o[i]=document.getElementById(i).value;document.getElementById('v'+i).textContent=parseFloat(o[i]).toFixed(i=='minpts'?0:2);});
+ o['cdrive']=document.getElementById('cdrive').checked?1:0;return o;}
 ids.forEach(function(i){document.getElementById(i).addEventListener('input',vals);});
 var mode=3;
 function setMode(m){
@@ -282,7 +358,7 @@ var mkLayout=function(){return {paper_bgcolor:'#ffffff',uirevision:'keep',
 var layouts={1:mkLayout(),2:mkLayout()};
 var inited={1:false,2:false};
 
-function sceneData(d, td, maxr, vmove){
+function sceneData(d, td, maxr, vmove, cmd){
   var data=[],stats={n:0,conf:0,move:0};
   // raw scan: dark structure points (SPENCER style)
   data.push({type:'scatter3d',mode:'markers',
@@ -344,27 +420,42 @@ function sceneData(d, td, maxr, vmove){
   data.push({type:'scatter3d',mode:'markers+text',x:[0],y:[0],z:[0.1],
     text:['ROBOT'],textfont:{color:'#1565c0',size:11},textposition:'bottom center',
     marker:{size:9,color:'#1565c0',symbol:'square'},hoverinfo:'skip',showlegend:false});
+  // Stage-3 controller command arrow (only when cmd given — i.e. Tracking 1).
+  if(cmd){
+    var ang=cmd.w*0.6;                       // turn intent (rad)
+    var len=0.35+cmd.v*2.0;                   // arrow length scales with v
+    var hx=len*Math.cos(ang), hy=len*Math.sin(ang);
+    var col=cmd.drive?'#00e676':'#9e9e9e';    // bright green = driving, gray = preview
+    data.push({type:'scatter3d',mode:'lines',x:[0,hx],y:[0,hy],z:[0.14,0.14],
+      line:{color:col,width:11},hoverinfo:'skip',showlegend:false});
+    data.push({type:'scatter3d',mode:'markers',x:[hx],y:[hy],z:[0.14],
+      marker:{size:7,color:col,symbol:'diamond'},hoverinfo:'skip',showlegend:false});
+  }
   return {data:data,stats:stats};
 }
-function render(divId, n, d, td, maxr, vmove){
-  var s=sceneData(d, td, maxr, vmove);
+function render(divId, n, d, td, maxr, vmove, cmd){
+  var s=sceneData(d, td, maxr, vmove, cmd);
   if(!inited[n]){Plotly.newPlot(divId,s.data,layouts[n],{responsive:true});inited[n]=true;}
   else{Plotly.react(divId,s.data,layouts[n]);}
   return s.stats;
 }
 function tick(){
- var v=vals();var qs=ids.map(function(i){return i+'='+v[i];}).join('&');
+ var v=vals();var qs=ids.map(function(i){return i+'='+v[i];}).join('&')+'&cdrive='+v.cdrive;
  fetch('/data?'+qs).then(function(r){return r.json();}).then(function(d){
   var maxr=parseFloat(v.maxr), vmove=parseFloat(v.vmove);
   var s1=null,s2=null;
-  if(mode==1||mode==3) s1=render('plot1',1,d,d.t1,maxr,vmove);
-  if(mode==2||mode==3) s2=render('plot2',2,d,d.t2,maxr,vmove);
+  if(mode==1||mode==3) s1=render('plot1',1,d,d.t1,maxr,vmove,d.cmd);  // cmd only on T1
+  if(mode==2||mode==3) s2=render('plot2',2,d,d.t2,maxr,vmove,null);
   var h='scans: '+d.nscan+'  (dt≈'+d.dt_est+'s)<br>clusters: '+d.nseg+
         '  <span class="red">detections: '+d.ndet+'</span><br>';
   h+='<span class="grn">T1</span> tracks: '+d.t1.tracks.length;
   if(s1) h+=' — <span class="blu">conf '+s1.conf+'</span>, <span class="org">moving '+s1.move+'</span>';
   h+='<br><span class="grn">T2</span> tracks: '+d.t2.tracks.length;
   if(s2) h+=' — <span class="blu">in view '+s2.conf+'</span>, <span class="org">moving '+s2.move+'</span>';
+  if(d.cmd){
+    var dc=d.cmd.drive?'<span style="color:#00e676">DRIVING</span>':'<span style="color:#9e9e9e">preview</span>';
+    h+='<br>CONTROL ['+dc+']: v='+d.cmd.v.toFixed(2)+' m/s  ω='+d.cmd.w.toFixed(2)+' rad/s';
+  }
   document.getElementById('status').innerHTML=h;
  }).catch(function(){});
 }
