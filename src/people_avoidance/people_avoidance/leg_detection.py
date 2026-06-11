@@ -28,7 +28,9 @@ from sensor_msgs.msg import LaserScan
 # ---------------------------------------------------------------------------
 RANGE_STD          = 0.02    # sigma_r, range noise std (m)        [Module 1, p.12]
 SEG_NOISE_K        = 3.0     # k in tau(r) = r*dtheta + k*sigma_r  [Eq.(4), p.60]
-MIN_CLUSTER_POINTS = 2       # n_min, drop single-point clusters   [p.61]
+MIN_CLUSTER_POINTS = 3       # n_min — Leigh leg_tracker / SPENCER value
+                             # (lecture floor is 2; 3 drops more noise and at
+                             #  our 0.5° A1 still detects legs to ~3.5 m)
 CIRCULARITY_MIN    = 0.15    # reject clearly wall-like clusters (wall ratio <~0.1) [p.123]
 PAIR_MIN_DIST      = 0.05    # min centre-to-centre to call two clusters a leg pair (m)
 COV_EPS            = 1e-9    # tiny diagonal floor so R stays positive-definite for the KF
