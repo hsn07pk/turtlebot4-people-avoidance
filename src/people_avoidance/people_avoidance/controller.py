@@ -65,7 +65,16 @@ _CFG = {
     'escape_dist': 1.2,       # only escape-turn when an obstacle is within (m)
     'escape_omega_frac': 0.6, # escape turn rate as a fraction of ω_max
     'slow_radius': 1.0,       # start slowing this far outside an obstacle (m)
+    # Follow-the-gap navigation (commits to an opening instead of oscillating)
+    'gap_clear': 0.10,        # extra angular clearance added to each obstacle (m)
+    'gap_hyst': 0.5,          # hysteresis: pull toward the last chosen heading
+    'gap_min_deg': 14.0,      # ignore openings narrower than this (deg)
 }
+
+# Heading the robot last committed to (radians, robot frame).  The hysteresis
+# in _gap_heading pulls toward this so the robot does not flip-flop left/right
+# in front of an obstacle — it commits to going around one side.
+_last_heading: float = 0.0
 
 # Navigation goal in the ODOM frame.  None → drive straight forward.
 _goal_odom: Optional[Tuple[float, float]] = None
@@ -74,9 +83,10 @@ _manual_cmd: Optional[Tuple[float, float]] = None   # (v, ω) manual override ta
 
 def set_goal(x: float, y: float) -> None:
     """Set the navigation goal (odom frame)."""
-    global _goal_odom, _manual_cmd
+    global _goal_odom, _manual_cmd, _last_heading
     _goal_odom = (float(x), float(y))
     _manual_cmd = None
+    _last_heading = 0.0          # forget the old commitment for a fresh goal
 
 
 def clear_goal() -> None:
@@ -109,6 +119,74 @@ def get_params() -> dict:
 
 def _angle_wrap(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _gap_heading(obs: List[dict], goal_ang: float) -> Optional[float]:
+    """
+    Follow-the-Gap: choose the best free heading around the obstacles.
+
+    Each obstacle blocks an angular wedge (its safety disk seen from the
+    robot).  Among the free openings wide enough for the robot, pick the
+    heading that best trades off proximity to the goal direction against a
+    HYSTERESIS pull toward the last committed heading — so the robot commits
+    to going around one side instead of oscillating, and will turn toward an
+    opening that is far to the side or behind it.
+
+    Returns the chosen heading (rad, robot frame), or None if fully boxed in.
+    """
+    global _last_heading
+    N = 90
+    binw = 2.0 * math.pi / N
+    blocked = [False] * N
+    for o in obs:
+        d = math.hypot(o['px'], o['py'])
+        if d < 1e-3:
+            continue
+        clr = o['r'] + _CFG['gap_clear']
+        ratio = min(0.999, clr / max(d, clr))
+        half = math.asin(ratio)                      # angular half-width blocked
+        cb = int((math.atan2(o['py'], o['px']) + math.pi) / binw) % N
+        steps = int(half / binw) + 1
+        for k in range(-steps, steps + 1):
+            blocked[(cb + k) % N] = True
+
+    if all(blocked):
+        return None
+
+    min_bins = max(1, int(math.radians(_CFG['gap_min_deg']) / binw))
+    best, best_cost = None, float('inf')
+    # scan contiguous free runs (doubled array handles wrap-around)
+    b2 = blocked + blocked
+    j = 0
+    while j < 2 * N:
+        if b2[j]:
+            j += 1
+            continue
+        k = j
+        while k < 2 * N and not b2[k]:
+            k += 1
+        if (k - j) >= min_bins and j < N:
+            for bi in range(j, k):
+                a = -math.pi + (bi % N + 0.5) * binw
+                cost = (abs(_angle_wrap(a - goal_ang))
+                        + _CFG['gap_hyst'] * abs(_angle_wrap(a - _last_heading)))
+                if cost < best_cost:
+                    best_cost, best = cost, a
+        j = k
+
+    if best is None:                                 # only narrow slivers free
+        for i in range(N):
+            if blocked[i]:
+                continue
+            a = -math.pi + (i + 0.5) * binw
+            cost = (abs(_angle_wrap(a - goal_ang))
+                    + _CFG['gap_hyst'] * abs(_angle_wrap(a - _last_heading)))
+            if cost < best_cost:
+                best_cost, best = cost, a
+
+    if best is not None:
+        _last_heading = best                         # commit (hysteresis)
+    return best
 
 
 # ---------------------------------------------------------------------------
@@ -272,31 +350,17 @@ def compute_velocity(
             dist_goal = float('inf')
             gdir = (1.0, 0.0)                       # forward
 
-        # Potential field: goal attraction + vortex obstacle repulsion.
-        Fx = _CFG['k_att'] * gdir[0]
-        Fy = _CFG['k_att'] * gdir[1]
-        infl = _CFG['influence']
-        for o in obs:
-            d = math.hypot(o['px'], o['py'])
-            if d < 1e-3 or d > infl:
-                continue
-            edge = max(d - o['r'], 0.05)            # distance to the obstacle edge
-            strength = _CFG['k_rep'] * (1.0 / edge - 1.0 / infl)
-            if strength <= 0:
-                continue
-            radial = (-o['px'] / d, -o['py'] / d)   # push away from obstacle
-            # tangential (perpendicular), pick the side that points toward goal
-            t1 = (-o['py'] / d, o['px'] / d)
-            t2 = (o['py'] / d, -o['px'] / d)
-            tang = t1 if (t1[0] * gdir[0] + t1[1] * gdir[1]) >= \
-                         (t2[0] * gdir[0] + t2[1] * gdir[1]) else t2
-            Fx += strength * (radial[0] + _CFG['vortex'] * tang[0])
-            Fy += strength * (radial[1] + _CFG['vortex'] * tang[1])
-
-        desired = math.atan2(Fy, Fx)               # robot heading is 0 in its frame
+        # Follow-the-Gap: steer toward the best free opening (commits to a
+        # side instead of oscillating; finds openings far to the side/behind).
+        goal_ang = math.atan2(gdir[1], gdir[0])
+        gap = _gap_heading(obs, goal_ang)
+        if gap is None:                            # fully boxed in → rotate out
+            desired = _last_heading if _last_heading != 0.0 else math.pi / 2
+        else:
+            desired = gap
         heading_err = _angle_wrap(desired)
         w_nom = _CFG['k_omega'] * heading_err
-        # forward speed: full toward heading, slowed near obstacles & goal
+        # forward speed: full when aimed at the opening, 0 while turning to it
         v_nom = max_linear_speed * max(0.0, math.cos(heading_err))
         nearest_edge = min((math.hypot(o['px'], o['py']) - o['r'] for o in obs),
                            default=float('inf'))
@@ -347,7 +411,14 @@ def compute_velocity(
     blocked = (v < _CFG['escape_v_frac'] * max(v_nom, 1e-3)
                and nearest_dist < _CFG['escape_dist'])
     if blocked:
-        turn_dir = 1.0 if left_block <= right_block else -1.0
+        # Turn toward the COMMITTED gap heading (Follow-the-Gap), not the
+        # instantaneous crowding — this keeps the robot rotating one way until
+        # the opening is in front, instead of oscillating left/right.  Falls
+        # back to the less-crowded side only if no heading is committed.
+        if abs(_last_heading) > 1e-3:
+            turn_dir = 1.0 if _last_heading > 0 else -1.0
+        else:
+            turn_dir = 1.0 if left_block <= right_block else -1.0
         w = turn_dir * _CFG['escape_omega_frac'] * max_angular_speed
         v = 0.0                                    # turn in place (always safe)
 
