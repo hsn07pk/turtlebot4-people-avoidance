@@ -7,7 +7,9 @@ Output: List[Track]           (maintained across scans)
 Each track i models one person as a Gaussian:
     X^i_t ~ N(m^i_t, P^i_t)
 
-State vector  m = [x, y, vx, vy]   (position + velocity in odom frame)
+State vector  m = [x, y, vx, vy]   (position + velocity in the **laser/robot
+frame** — measurements come from leg_detection in the laser frame and are not
+transformed, so the controller treats the robot as the origin).
 Covariance    P is 4 × 4.
 
 Students implement:
@@ -77,6 +79,8 @@ class Track:
     misses:    int = 0
     hits:      int = 0
     confirmed: bool = False
+    static:    bool = False   # True once persistence shows it has not moved
+                              # (lecture Module 4 p.198: static-object rejection)
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +161,12 @@ class KalmanTracker:
         self.init_vel_std = init_vel_std
         self.merge_dist = merge_dist
         self.merge_vel = merge_vel
+        # Static-object rejection (lecture Module 4 p.198): a confirmed track
+        # whose accumulated displacement stays below `static_dist` over the
+        # last `static_window` scans is flagged static (chair legs, posts…).
+        self.static_window = 20          # N ≈ 2 s at 10 Hz
+        self.static_dist = 0.12          # δ_min (m)
+        self._pos_hist: Dict[int, list] = {}
         self.tracks: List[Track] = []
         self._next_id: int = 0
         # Measurement indices that fell inside at least one track's gate in
@@ -405,6 +415,24 @@ class KalmanTracker:
         # "track merging").  Same position AND same velocity = one person;
         # crossing people share position only briefly but never velocity.
         self._merge_duplicate_tracks()
+
+        # Step 8 — static-object rejection (lecture Module 4 p. 198).  Flag a
+        # confirmed track as static when its displacement over the last
+        # `static_window` scans stays below `static_dist` (furniture, posts).
+        live_ids = {t.track_id for t in self.tracks}
+        self._pos_hist = {tid: h for tid, h in self._pos_hist.items()
+                          if tid in live_ids}
+        for t in self.tracks:
+            h = self._pos_hist.setdefault(t.track_id, [])
+            h.append((float(t.m[0]), float(t.m[1])))
+            if len(h) > self.static_window:
+                del h[0]
+            if t.confirmed and len(h) >= self.static_window:
+                dx = h[-1][0] - h[0][0]
+                dy = h[-1][1] - h[0][1]
+                t.static = float(np.hypot(dx, dy)) < self.static_dist
+            else:
+                t.static = False
 
     def _merge_duplicate_tracks(self) -> None:
         """Collapse track pairs that agree in position and velocity."""

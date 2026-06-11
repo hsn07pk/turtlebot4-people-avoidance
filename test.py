@@ -122,6 +122,7 @@ def _tracker_snapshot(key, tracker, horizon):
             'vx': round(vx, 3), 'vy': round(vy, 3),
             'speed': round(math.hypot(vx, vy), 3),
             'conf': trk.confirmed, 'hits': trk.hits, 'misses': trk.misses,
+            'static': bool(getattr(trk, 'static', False)),  # Module-4 persistence
         })
         hist = trails.get(trk.track_id, [])
         hist.append((round(x, 2), round(y, 2)))

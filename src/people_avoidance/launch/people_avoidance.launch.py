@@ -18,12 +18,13 @@ def generate_launch_description():
                 'laser_frame':           'rplidar_link',
                 'odom_frame':            'odom',
                 # ── Kalman filter ────────────────────────────────────────────
-                'dt':                    0.1,    # seconds; match to LiDAR scan rate
+                'dt':                    0.13,   # s; matches the A1 ~7.7 Hz scan rate
                 'max_misses':            5,      # frames before a track is deleted
-                # ── Leg detection ────────────────────────────────────────────
-                'distance_threshold':    0.1,    # segmentation gap (m)
-                'leg_radius':            0.10,   # expected single-leg radius (m)
-                'max_leg_width':         0.25,   # max distance between paired legs (m)
+                # ── Leg detection (research-backed: Leigh leg_tracker / Arras /
+                #    anthropometry — see PRESETS.md; A1 measured at 0.5°) ───────
+                'distance_threshold':    0.13,   # segmentation gap (m); Leigh 0.13
+                'leg_radius':            0.06,   # single-leg radius (m); calf ~6 cm
+                'max_leg_width':         0.40,   # leg-pair separation (m); lecture d_max
                 # ── Controller ───────────────────────────────────────────────
                 'max_linear_speed':      0.2,    # m/s
                 'max_angular_speed':     1.0,    # rad/s

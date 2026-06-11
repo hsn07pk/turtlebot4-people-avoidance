@@ -275,6 +275,11 @@ def detect_legs(
     #   circularity — reject clearly elongated runs (walls).
     single_leg_width = 2.0 * leg_radius
     width_max = max(1.8 * single_leg_width, max_leg_width)   # legs-together allowance
+    # Lower width gate (lecture Module 3, w_min): reject clusters far thinner
+    # than any real leg (wires, thin poles ≲3 cm).  Kept as a conservative
+    # absolute floor so it never rejects a genuine leg (≥6 cm) even when
+    # leg_radius is set large.
+    width_min = 0.03
     candidates = []  # each: {'p': centroid(2,), 'n': int, 'R': (2,2)}
     for seg in segments:
         n = seg.shape[0]
@@ -282,6 +287,8 @@ def detect_legs(
             continue
         width, circularity = _cluster_shape(seg)
         if width > width_max:                    # too wide -> wall / large object
+            continue
+        if n >= 4 and width < width_min:         # too thin -> pole/wire, not a leg
             continue
         # Secondary wall filter: only drop a cluster that is BOTH wider than a single
         # leg AND clearly linear AND well-sampled (a wall fragment).  A narrow,
