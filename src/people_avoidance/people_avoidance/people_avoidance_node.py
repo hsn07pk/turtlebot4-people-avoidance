@@ -58,9 +58,18 @@ import math
 
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
+
+# The TurtleBot4 publishes /scan and /odom with BEST_EFFORT (SensorData) QoS.
+# A default (RELIABLE) subscriber is QoS-incompatible and receives NOTHING from
+# the real robot — the node would spin forever publishing zeros.  Subscribe
+# with BEST_EFFORT so the pipeline actually receives sensor data on hardware.
+_SENSOR_QOS = QoSProfile(depth=10,
+                         reliability=ReliabilityPolicy.BEST_EFFORT,
+                         history=HistoryPolicy.KEEP_LAST)
 
 from .leg_detection import detect_legs
 from .tracking import KalmanTracker
@@ -101,8 +110,8 @@ class PeopleAvoidanceNode(Node):
         self._robot_theta: float = 0.0
 
         # ── Subscriptions ─────────────────────────────────────────────────────
-        self.create_subscription(LaserScan, p['scan_topic'], self._scan_cb, 10)
-        self.create_subscription(Odometry,  p['odom_topic'], self._odom_cb, 10)
+        self.create_subscription(LaserScan, p['scan_topic'], self._scan_cb, _SENSOR_QOS)
+        self.create_subscription(Odometry,  p['odom_topic'], self._odom_cb, _SENSOR_QOS)
 
         # ── Publisher ─────────────────────────────────────────────────────────
         self._cmd_pub = self.create_publisher(Twist, p['cmd_vel_topic'], 10)

@@ -148,7 +148,7 @@ def _solve_qp_2d(
     enumeration.  Constraint count is tiny (≤ ~people+4), so this is fast and
     has no solver dependency (cvxopt is unavailable offline on the VM).
     """
-    sw = math.sqrt(w_omega)
+    sw = math.sqrt(max(w_omega, 1e-9))      # guard ω-weight 0 (div-by-zero)
     # Box constraints as rows in (v, ω):  v≤v_max, -v≤-v_min, ω≤w_max, -ω≤w_max
     all_rows = list(rows) + [
         (1.0, 0.0, v_max), (-1.0, 0.0, -v_min),
@@ -326,9 +326,14 @@ def compute_velocity(
     blocked = (v < _CFG['escape_v_frac'] * max(v_nom, 1e-3)
                and nearest_dist < _CFG['escape_dist'])
     if blocked:
-        # Turn toward the side with less crowding (default left if symmetric).
+        # Turn toward the side with less crowding (default left if symmetric),
+        # and STOP forward motion (v=0).  Turning in place keeps a disk robot
+        # safe regardless of the CBF rows — whereas keeping the QP's forward v
+        # with an overridden ω could violate a coupled CBF constraint.  This
+        # preserves the safety guarantee while breaking the symmetric deadlock.
         turn_dir = 1.0 if left_block <= right_block else -1.0
         w = turn_dir * _CFG['escape_omega_frac'] * max_angular_speed
+        v = 0.0
 
     cmd.linear.x = float(np.clip(v, 0.0, max_linear_speed))
     cmd.angular.z = float(np.clip(w, -max_angular_speed, max_angular_speed))
