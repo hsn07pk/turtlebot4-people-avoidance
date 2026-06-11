@@ -47,7 +47,10 @@ from .tracking import Track
 # Controller configuration (defaults; overridable via set_params)
 # ---------------------------------------------------------------------------
 _CFG = {
-    'lookahead': 0.30,        # L — virtual probe distance ahead of the robot (m)
+    'lookahead': 0.15,        # L — virtual probe distance ahead of the robot (m).
+                              # The barrier inflates each obstacle by (r+L), so a
+                              # long L blocks tight gaps; 0.15 lets the robot
+                              # thread ~0.5 m gaps while keeping QP steering.
     'gamma': 2.0,             # CBF class-K gain γ
     'w_omega': 0.1,           # QP weight on ω  (<1 ⇒ "steer before brake")
     'person_radius': 0.30,    # physical half-width of a person (m)
@@ -69,7 +72,9 @@ _CFG = {
     # Follow-the-gap navigation (commits to an opening instead of oscillating)
     'gap_clear': 0.04,        # extra angular clearance added to each obstacle (m)
     'gap_hyst': 0.5,          # hysteresis: pull toward the last chosen heading
-    'gap_min_deg': 14.0,      # ignore openings narrower than this (deg)
+    'gap_min_deg': 4.0,       # ignore only single-bin noise — a FAR gap is
+                              # angularly thin even when the robot easily fits
+                              # (the obstacle shadows already encode clearance)
     # Back-off reflex: reverse out of the danger zone (e.g. a foot in front)
     'backoff_trigger': 0.38,  # reverse when nearest front obstacle is within (m)
     'backoff_clear': 0.60,    # stop reversing once it is beyond this (m, hysteresis)
@@ -83,8 +88,21 @@ _CFG = {
 # in front of an obstacle — it commits to going around one side.
 _last_heading: float = 0.0
 
-# True while the back-off reflex is reversing out of the danger zone.
+# Back-off reflex state.  _backing = currently reversing; _backoff_cycles =
+# how long it has been reversing (anti-latch); _backoff_cooldown = blocks
+# re-triggering for a while after a latched back-off is force-aborted.
 _backing: bool = False
+_backoff_cycles: int = 0
+_backoff_cooldown: int = 0
+_BACKOFF_MAX_CYCLES = 16       # ~2 s at 8 Hz — give up reversing after this
+_BACKOFF_COOLDOWN = 24         # ~3 s — rotate/replan instead of re-reversing
+
+# Escape (turn-in-place) state.  Once the robot starts turning one way to get
+# unblocked it COMMITS to that direction for _ESCAPE_HOLD cycles, so it cannot
+# vibrate left/right in front of a wall.
+_escape_dir: float = 0.0
+_escape_hold: int = 0
+_ESCAPE_HOLD = 12              # ~1.5 s of committed turning before re-deciding
 
 # Navigation goal in the ODOM frame.  None → drive straight forward.
 _goal_odom: Optional[Tuple[float, float]] = None
@@ -94,10 +112,13 @@ _manual_cmd: Optional[Tuple[float, float]] = None   # (v, ω) manual override ta
 def set_goal(x: float, y: float) -> None:
     """Set the navigation goal (odom frame)."""
     global _goal_odom, _manual_cmd, _last_heading, _backing
+    global _backoff_cycles, _backoff_cooldown
     _goal_odom = (float(x), float(y))
     _manual_cmd = None
     _last_heading = 0.0          # forget the old commitment for a fresh goal
     _backing = False
+    _backoff_cycles = 0
+    _backoff_cooldown = 0
 
 
 def clear_goal() -> None:
@@ -341,23 +362,37 @@ def compute_velocity(
     obs = _gather_obstacles(tracks, obstacle_points, obstacle_radius_scale)
 
     # ── 0. Back-off reflex ────────────────────────────────────────────────
-    # If an obstacle is in the danger zone right ahead (a foot stepping in
+    # If an obstacle sits in the danger zone DIRECTLY ahead (a foot stepping in
     # front) and there is room behind, REVERSE out until clear — then the
-    # normal navigation below can find a way around.  Safe: we only back up
-    # while the space behind stays clearer than backoff_rear_min.
-    global _backing
+    # normal navigation finds a way around.  Guards against the two ways this
+    # could go wrong: (a) a NARROW ±35° cone so gap-edge walls (off to the
+    # side as the robot enters an opening) do NOT trigger it, and (b) an
+    # anti-latch — if it cannot make progress within _BACKOFF_MAX_CYCLES it
+    # gives up reversing and lets the navigation rotate to find another way,
+    # with a cooldown so it does not immediately re-reverse.
+    global _backing, _backoff_cycles, _backoff_cooldown
     front = [math.hypot(o['px'], o['py']) for o in obs
-             if abs(math.atan2(o['py'], o['px'])) < math.radians(75)]
+             if abs(math.atan2(o['py'], o['px'])) < math.radians(35)]
     rear = [math.hypot(o['px'], o['py']) for o in obs
             if abs(math.atan2(o['py'], o['px'])) > math.radians(105)]
     near_front = min(front, default=float('inf'))
     near_rear = min(rear, default=float('inf'))
     rear_min = _CFG['backoff_rear_min']
+    if _backoff_cooldown > 0:
+        _backoff_cooldown -= 1
     if _backing:
+        _backoff_cycles += 1
         if near_front > _CFG['backoff_clear'] or near_rear < rear_min:
-            _backing = False
-    elif near_front < _CFG['backoff_trigger'] and near_rear > rear_min:
+            _backing = False                           # cleared, or rear blocked
+            _backoff_cycles = 0
+        elif _backoff_cycles > _BACKOFF_MAX_CYCLES:
+            _backing = False                           # latched — give up reversing
+            _backoff_cycles = 0
+            _backoff_cooldown = _BACKOFF_COOLDOWN       # let nav rotate instead
+    elif (near_front < _CFG['backoff_trigger'] and near_rear > rear_min
+          and _backoff_cooldown == 0):
         _backing = True
+        _backoff_cycles = 0
     if _backing:
         v = -min(_CFG['backoff_speed'], max_linear_speed)
         if near_rear < rear_min + 0.3:                 # ease off near rear limit
@@ -445,19 +480,25 @@ def compute_velocity(
     )
 
     # ── 3. Deadlock escape (last resort) ──────────────────────────────────
+    global _escape_dir, _escape_hold
     blocked = (v < _CFG['escape_v_frac'] * max(v_nom, 1e-3)
                and nearest_dist < _CFG['escape_dist'])
     if blocked:
-        # Turn toward the COMMITTED gap heading (Follow-the-Gap), not the
-        # instantaneous crowding — this keeps the robot rotating one way until
-        # the opening is in front, instead of oscillating left/right.  Falls
-        # back to the less-crowded side only if no heading is committed.
-        if abs(_last_heading) > 1e-3:
-            turn_dir = 1.0 if _last_heading > 0 else -1.0
-        else:
-            turn_dir = 1.0 if left_block <= right_block else -1.0
-        w = turn_dir * _CFG['escape_omega_frac'] * max_angular_speed
+        # Turn in place to get unblocked, COMMITTING to one direction for a
+        # stretch so the robot cannot vibrate left/right.  The committed
+        # direction is chosen once (toward the gap heading, else the less-
+        # crowded side) and held for _ESCAPE_HOLD cycles.
+        if _escape_hold <= 0:
+            if abs(_last_heading) > 1e-3:
+                _escape_dir = 1.0 if _last_heading > 0 else -1.0
+            else:
+                _escape_dir = 1.0 if left_block <= right_block else -1.0
+            _escape_hold = _ESCAPE_HOLD
+        _escape_hold -= 1
+        w = _escape_dir * _CFG['escape_omega_frac'] * max_angular_speed
         v = 0.0                                    # turn in place (always safe)
+    else:
+        _escape_hold = 0                           # cleared — re-decide next time
 
     cmd.linear.x = float(np.clip(v, 0.0, max_linear_speed))
     cmd.angular.z = float(np.clip(w, -max_angular_speed, max_angular_speed))
