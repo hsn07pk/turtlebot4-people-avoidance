@@ -120,7 +120,7 @@ class KalmanTracker:
         max_misses: int = 5,
         process_noise_density: float = 1.0,
         gate_chi2: float = 9.21,
-        confirm_hits: int = 3,
+        confirm_hits: int = 4,
         init_vel_std: float = 1.5,
         merge_dist: float = 0.35,
         merge_vel: float = 0.45,
