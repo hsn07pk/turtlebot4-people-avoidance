@@ -102,6 +102,27 @@ _CFG = {
 # left/right spin-dance).  _last_heading is the robot-frame projection used
 # by the escape; refreshed every cycle from the world value.
 _last_heading_world: Optional[float] = None
+_spin_dir: Optional[float] = None     # committed turn-in-place direction
+
+
+def _commit_spin(cmd, heading_err, w_max):
+    """Latch ONE rotation direction while turning in place toward a far-off
+    heading.  At v=0 the CBF rows and bubble-exit pick omega's sign from
+    whichever obstacle is momentarily 'worst', which dithers +-w forever when
+    the goal is behind (live slalom HOME failure: 107 sign flips, 75 s stuck).
+    Pure rotation of a round robot is collision-free, so sign override is safe."""
+    global _spin_dir
+    if heading_err is None:
+        _spin_dir = None
+        return cmd
+    if cmd.linear.x < 0.03 and abs(heading_err) > (0.9 if _spin_dir is None else 0.5):
+        if _spin_dir is None:
+            _spin_dir = 1.0 if heading_err > 0 else -1.0
+        mag = max(0.6 * w_max, abs(cmd.angular.z))
+        cmd.angular.z = float(np.clip(_spin_dir * mag, -w_max, w_max))
+    else:
+        _spin_dir = None
+    return cmd
 _last_heading: float = 0.0
 
 # Back-off reflex state.  _backing = currently reversing; _backoff_cycles =
@@ -129,7 +150,8 @@ def set_goal(x: float, y: float) -> None:
     """Set the navigation goal (odom frame)."""
     global _goal_odom, _manual_cmd, _last_heading, _backing
     global _backoff_cycles, _backoff_cooldown
-    global _last_heading_world
+    global _last_heading_world, _spin_dir
+    _spin_dir = None
     _goal_odom = (float(x), float(y))
     _manual_cmd = None
     _last_heading = 0.0          # forget the old commitment for a fresh goal
@@ -454,6 +476,7 @@ def compute_velocity(
         return _smooth(cmd)
 
     # ── 1. NOMINAL command ────────────────────────────────────────────────
+    heading_err = None
     if _manual_cmd is not None:
         # Manual drive: take the operator's (v, ω) as the nominal.
         v_nom = float(np.clip(_manual_cmd[0], 0.0, max_linear_speed))
@@ -558,7 +581,7 @@ def compute_velocity(
         else:
             cmd.linear.x = 0.0
             cmd.angular.z = float(np.clip(math.copysign(_CFG['escape_omega_frac']*max_angular_speed, err), -max_angular_speed, max_angular_speed))
-        return _smooth(cmd)
+        return _smooth(_commit_spin(cmd, heading_err, max_angular_speed))
 
     global _escape_dir, _escape_hold
     try:
@@ -587,4 +610,4 @@ def compute_velocity(
 
     cmd.linear.x = float(np.clip(v, 0.0, max_linear_speed))
     cmd.angular.z = float(np.clip(w, -max_angular_speed, max_angular_speed))
-    return _smooth(cmd)
+    return _smooth(_commit_spin(cmd, heading_err, max_angular_speed))
