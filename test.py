@@ -73,15 +73,15 @@ def _to_base_meas(m):
 
 # Live-tunable parameters (sliders write here; the scan callback reads).
 params = {
-    # Stage 1 detection
-    'dt': 0.13, 'lr': 0.06, 'mlw': 0.65, 'circ': 0.20, 'minpts': 3, 'maxr': 4.0,
+    # Stage 1 detection         (lab-tuned live on 2026-06-12)
+    'dt': 0.30, 'lr': 0.10, 'mlw': 0.41, 'circ': 0.80, 'minpts': 14, 'maxr': 1.30,
     # Stage 2 tracking
-    'gate': 9.21, 'q': 1.0, 'horizon': 2.0, 'vmove': 0.3,
+    'gate': 5.40, 'q': 1.0, 'horizon': 3.0, 'vmove': 0.3,
     # Stage 3 control
-    'cmaxv': 0.26, 'cmaxw': 1.20, 'clook': 0.10, 'cgamma': 2.5, 'cwom': 0.10,
-    'cpr': 0.30, 'cwr': 0.03, 'crr': 0.18, 'cinf': 1.5, 'cors': 2.0, 'ctpred': 0.30,
+    'cmaxv': 0.35, 'cmaxw': 1.70, 'clook': 0.15, 'cgamma': 2.0, 'cwom': 0.10,
+    'cpr': 0.10, 'cwr': 0.01, 'crr': 0.10, 'cinf': 0.60, 'cors': 2.0, 'ctpred': 0.30,
     'cgapclr': 0.04, 'cgaphyst': 0.5,
-    'cbtrig': 0.38, 'cbclear': 0.60, 'cbspeed': 0.10, 'cbrear': 0.50,
+    'cbtrig': 0.40, 'cbclear': 0.60, 'cbspeed': 0.10, 'cbrear': 0.50,
     'cdrive': 0.0,
 }
 
@@ -452,7 +452,7 @@ HTML_TAIL = """
 var ids=__IDS__;
 var PRESETS={
  'research':{dt:0.13,lr:0.06,mlw:0.65,circ:0.20,minpts:3,maxr:4.0,gate:9.21,q:1.0,horizon:2.0,vmove:0.30,cmaxv:0.20,cmaxw:1.00,clook:0.15,cgamma:2.0,cwom:0.10,cpr:0.30,cwr:0.03,crr:0.18,cinf:1.5,cors:1.0,ctpred:0.30,cgapclr:0.04,cgaphyst:0.5,cbtrig:0.38,cbclear:0.60,cbspeed:0.10,cbrear:0.50},
- 'default':{dt:0.13,lr:0.06,mlw:0.65,circ:0.20,minpts:3,maxr:4.0,gate:9.21,q:1.0,horizon:2.0,vmove:0.30,cmaxv:0.26,cmaxw:1.20,clook:0.10,cgamma:2.5,cwom:0.10,cpr:0.30,cwr:0.03,crr:0.18,cinf:1.5,cors:2.0,ctpred:0.30,cgapclr:0.04,cbtrig:0.38,cgaphyst:0.5,cbclear:0.60,cbspeed:0.10,cbrear:0.50}};
+ 'default':{dt:0.30,lr:0.10,mlw:0.41,circ:0.80,minpts:14,maxr:1.30,gate:5.40,q:1.0,horizon:3.0,vmove:0.30,cmaxv:0.35,cmaxw:1.70,clook:0.15,cgamma:2.0,cwom:0.10,cpr:0.10,cwr:0.01,crr:0.10,cinf:0.60,cors:2.0,ctpred:0.30,cgapclr:0.04,cbtrig:0.40,cgaphyst:0.5,cbclear:0.60,cbspeed:0.10,cbrear:0.50}};
 function applyPreset(){var p=PRESETS[document.getElementById('preset').value];if(!p)return;
  ids.forEach(function(i){if(p[i]!==undefined)document.getElementById(i).value=p[i];});vals();}
 function vals(){var o={};ids.forEach(function(i){o[i]=document.getElementById(i).value;
