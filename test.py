@@ -601,6 +601,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(b'ok')
         elif u.path == '/clear_goal':
             ctrl.clear_goal(); self._send(b'ok')
+        elif u.path == '/params':
+            self._send(json.dumps(params).encode(), 'application/json')
         elif u.path == '/reset':
             state['tracker'] = None; state['trails'] = {}; self._send(b'ok')
         else:
