@@ -404,8 +404,26 @@ class KalmanTracker:
         # unmatched measurement that lies inside some track's gate is most
         # likely a duplicate detection of an already-tracked person — turning
         # those into tracks causes duplicate-track churn.
+        #
+        # Walking-leg guard (measured on a recorded stride, frames 196-216 of
+        # the T2 session): mid-stride the front leg lands ~0.5 m ahead of the
+        # tracked body centre — outside every gate — and would spawn a
+        # duplicate that then steals the track when the legs come together.
+        # So ALSO suppress spawning near a confirmed MOVING track (its other
+        # leg zone). Static tracks don't suppress, so a new person appearing
+        # next to furniture is still picked up.
         for mi, meas in enumerate(measurements):
-            if mi not in matched_meas_idxs and mi not in self._gated_meas_idxs:
+            if mi in matched_meas_idxs or mi in self._gated_meas_idxs:
+                continue
+            near_moving = False
+            for t in self.tracks:
+                if not t.confirmed:
+                    continue
+                if (np.hypot(t.m[2], t.m[3]) > 0.2 and
+                        np.hypot(t.m[0] - meas.x, t.m[1] - meas.y) < 0.6):
+                    near_moving = True
+                    break
+            if not near_moving:
                 self._spawn_track(meas)
 
         # Step 6 — prune tracks that have coasted too long.
