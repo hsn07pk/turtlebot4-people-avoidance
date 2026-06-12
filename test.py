@@ -74,11 +74,11 @@ def _to_base_meas(m):
 # Live-tunable parameters (sliders write here; the scan callback reads).
 params = {
     # Stage 1 detection
-    'dt': 0.13, 'lr': 0.06, 'mlw': 0.40, 'circ': 0.20, 'minpts': 3, 'maxr': 4.0,
+    'dt': 0.13, 'lr': 0.06, 'mlw': 0.50, 'circ': 0.20, 'minpts': 3, 'maxr': 4.0,
     # Stage 2 tracking
-    'gate': 9.21, 'q': 0.5, 'horizon': 2.0, 'vmove': 0.3,
+    'gate': 9.21, 'q': 1.0, 'horizon': 2.0, 'vmove': 0.3,
     # Stage 3 control
-    'cmaxv': 0.20, 'cmaxw': 1.00, 'clook': 0.15, 'cgamma': 2.0, 'cwom': 0.10,
+    'cmaxv': 0.26, 'cmaxw': 1.20, 'clook': 0.10, 'cgamma': 2.5, 'cwom': 0.10,
     'cpr': 0.30, 'cwr': 0.03, 'crr': 0.18, 'cinf': 1.5, 'cors': 2.0, 'ctpred': 0.30,
     'cgapclr': 0.04, 'cgaphyst': 0.5,
     'cbtrig': 0.38, 'cbclear': 0.60, 'cbspeed': 0.10, 'cbrear': 0.50,
@@ -114,8 +114,11 @@ def on_odom(msg):
 def _ensure_tracker():
     tr = state['tracker']
     if tr is None:
+        # max_misses=8 (~1 s at 7.7 Hz): standing people occasionally drop a
+        # few detections (legs merge / brief occlusion) — 5 was killing and
+        # respawning their tracks, which the user sees as a vanishing person.
         tr = KalmanTracker(dt=state['dt_est'], process_noise_density=params['q'],
-                           gate_chi2=params['gate'])
+                           gate_chi2=params['gate'], max_misses=8)
         state['tracker'] = tr
     tr.gate_chi2 = params['gate']
     tr.Q = WIENER_Q(params['q'], tr.dt)
@@ -172,10 +175,43 @@ def on_scan(scan):
     dets = [_to_base_meas(m) for m in
             detect_legs(scan, distance_threshold=params['dt'],
                         leg_radius=params['lr'], max_leg_width=params['mlw'])]
+    # drop the robot's own mounting posts (self-detections at ~0.2 m)
+    dets = [m for m in dets if math.hypot(m.x, m.y) > 0.30]
+
+    # ── ODOM-FRAME TRACKING ──────────────────────────────────────────────
+    # Track in the WORLD frame so static people stay static while the ROBOT
+    # moves (robot-frame tracking gives them phantom ego-motion velocities,
+    # which corrupt the moving-obstacle CBF and the displayed speeds).
+    rx0, ry0, rth0 = state['pose']
+    c0, s0 = math.cos(rth0), math.sin(rth0)
+    odom_dets = []
+    for m in dets:
+        ox_ = rx0 + c0*m.x - s0*m.y
+        oy_ = ry0 + s0*m.x + c0*m.y
+        rxx = c0*c0*m.Rxx - 2*c0*s0*m.Rxy + s0*s0*m.Ryy
+        ryy = s0*s0*m.Rxx + 2*c0*s0*m.Rxy + c0*c0*m.Ryy
+        rxy = c0*s0*m.Rxx + (c0*c0 - s0*s0)*m.Rxy - c0*s0*m.Ryy
+        odom_dets.append(LegMeasurement(x=ox_, y=oy_, Rxx=rxx, Rxy=rxy, Ryy=ryy))
 
     tr = _ensure_tracker()
-    tr.update(dets)
-    tracks = tr.get_tracks()
+    tr.update(odom_dets)
+    tracks_odom = tr.get_tracks()
+
+    class _RT:                       # robot-frame view of an odom track
+        __slots__ = ('m', 'P', 'track_id', 'confirmed', 'static', 'hits', 'misses')
+    tracks = []
+    for t in tracks_odom:
+        xo, yo, vxo, vyo = (float(v) for v in t.m)
+        dx_, dy_ = xo - rx0, yo - ry0
+        rt = _RT()
+        rt.m = np.array([c0*dx_ + s0*dy_, -s0*dx_ + c0*dy_,
+                         c0*vxo + s0*vyo, -s0*vxo + c0*vyo])
+        rt.P = t.P                   # eigenvalues are rotation-invariant
+        rt.track_id = t.track_id
+        rt.confirmed = t.confirmed
+        rt.static = bool(getattr(t, 'static', False))
+        rt.hits, rt.misses = t.hits, t.misses
+        tracks.append(rt)
 
     obstacles = _extract_obstacles(pts, tracks, params['cinf'], params['cpr'])
 
@@ -208,21 +244,27 @@ def on_scan(scan):
 
     # track rows + trails + preds
     trails = state['trails']; rows = []; live = {}
-    for t in tracks:
+    def _to_rob(xo_, yo_):
+        dx_, dy_ = xo_ - rx0, yo_ - ry0
+        return (c0*dx_ + s0*dy_, -s0*dx_ + c0*dy_)
+    for t, to in zip(tracks, tracks_odom):
         x, y, vx, vy = (float(v) for v in t.m)
-        cov_r = ctrl.obstacle_radius(t, params['cors'])
+        # same clamp the controller applies — display matches decisions
+        cov_r = min(ctrl.obstacle_radius(t, params['cors']),
+                    ctrl._CFG['cors_cap'])
         rows.append({'id': t.track_id, 'x': round(x, 3), 'y': round(y, 3),
                      'vx': round(vx, 3), 'vy': round(vy, 3),
-                     'speed': round(math.hypot(vx, vy), 3),
+                     'speed': round(math.hypot(float(to.m[2]), float(to.m[3])), 3),
                      'conf': t.confirmed, 'static': bool(getattr(t, 'static', False)),
                      'r': round(params['cpr']+params['crr']+cov_r, 2)})
-        h = trails.get(t.track_id, []); h.append((round(x, 2), round(y, 2)))
+        h = trails.get(t.track_id, [])
+        h.append((round(float(to.m[0]), 2), round(float(to.m[1]), 2)))   # odom
         live[t.track_id] = h[-TRAIL_LEN:]
     state['trails'] = live
-    preds = {str(t.track_id): [[round(float(r[0]), 2), round(float(r[1]), 2)]
-                               for r in arr]
-             for t, arr in zip(tracks, [tr.predict_ahead(params['horizon']).get(t.track_id, [])
-                                        for t in tracks])}
+    preds_odom = tr.predict_ahead(params['horizon'])
+    preds = {str(t.track_id): [[round(v_, 2) for v_ in _to_rob(float(r[0]), float(r[1]))]
+                               for r in preds_odom.get(t.track_id, [])]
+             for t in tracks_odom}
 
     point_rows, sid = [], 0
     for seg in segs:
@@ -237,7 +279,8 @@ def on_scan(scan):
         'dt_est': round(state['dt_est'], 3),
         'cmd': {'v': round(cv, 3), 'w': round(cw, 3), 'drive': params['cdrive'] >= 0.5},
         'tracks': rows, 'preds': preds,
-        'trails': {str(k): v[::2] for k, v in live.items()},
+        'trails': {str(k): [[round(a_, 2) for a_ in _to_rob(px_, py_)]
+                            for (px_, py_) in v[::2]] for k, v in live.items()},
         'obstacles': [[round(o[0], 2), round(o[1], 2)] for o in obstacles],
         'goal': goal_robot, 'path': _rollout_path(cv, cw),
         'influence': params['cinf'], 'lookahead': params['clook'],
@@ -396,8 +439,8 @@ HTML_TAIL = """
 <script>
 var ids=__IDS__;
 var PRESETS={
- 'research':{dt:0.13,lr:0.06,mlw:0.40,circ:0.20,minpts:3,maxr:4.0,gate:9.21,q:0.5,horizon:2.0,vmove:0.30,cmaxv:0.20,cmaxw:1.00,clook:0.15,cgamma:2.0,cwom:0.10,cpr:0.30,cwr:0.03,crr:0.18,cinf:1.5,cors:2.0,ctpred:0.30,cgapclr:0.04,cgaphyst:0.5,cbtrig:0.38,cbclear:0.60,cbspeed:0.10,cbrear:0.50},
- 'default':{dt:0.30,lr:0.20,mlw:0.60,circ:0.80,minpts:12,maxr:2.0,gate:5.40,q:1.0,horizon:3.0,vmove:0.30,cmaxv:0.20,cmaxw:1.00,clook:0.15,cgamma:2.0,cwom:0.10,cpr:0.30,cwr:0.03,crr:0.18,cinf:1.5,cors:2.0,ctpred:0.30,cgapclr:0.04,cgaphyst:0.5,cbtrig:0.38,cbclear:0.60,cbspeed:0.10,cbrear:0.50}};
+ 'research':{dt:0.13,lr:0.06,mlw:0.50,circ:0.20,minpts:3,maxr:4.0,gate:9.21,q:1.0,horizon:2.0,vmove:0.30,cmaxv:0.20,cmaxw:1.00,clook:0.15,cgamma:2.0,cwom:0.10,cpr:0.30,cwr:0.03,crr:0.18,cinf:1.5,cors:1.0,ctpred:0.30,cgapclr:0.04,cgaphyst:0.5,cbtrig:0.38,cbclear:0.60,cbspeed:0.10,cbrear:0.50},
+ 'default':{dt:0.13,lr:0.06,mlw:0.50,circ:0.20,minpts:3,maxr:4.0,gate:9.21,q:1.0,horizon:2.0,vmove:0.30,cmaxv:0.26,cmaxw:1.20,clook:0.10,cgamma:2.5,cwom:0.10,cpr:0.25,cwr:0.03,crr:0.17,cinf:1.5,cors:1.0,ctpred:0.25,cgapclr:0.03,cbtrig:0.30,cgaphyst:0.6,cbclear:0.55,cbspeed:0.10,cbrear:0.50}};
 function applyPreset(){var p=PRESETS[document.getElementById('preset').value];if(!p)return;
  ids.forEach(function(i){if(p[i]!==undefined)document.getElementById(i).value=p[i];});vals();}
 function vals(){var o={};ids.forEach(function(i){o[i]=document.getElementById(i).value;
