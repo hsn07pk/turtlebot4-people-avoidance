@@ -34,6 +34,12 @@ MIN_CLUSTER_POINTS = 3       # n_min — Leigh leg_tracker / SPENCER value
 CIRCULARITY_MIN    = 0.15    # reject clearly wall-like clusters (wall ratio <~0.1) [p.123]
 PAIR_MIN_DIST      = 0.05    # min centre-to-centre to call two clusters a leg pair (m)
 COV_EPS            = 1e-9    # tiny diagonal floor so R stays positive-definite for the KF
+GAIT_STD           = 0.08    # gait wobble of the person-centre observation (m):
+                             # legs alternate around the body centre, so the
+                             # measurement noise of a PERSON position is ~8 cm,
+                             # not the mm-level sensor noise. Keeps the tracker
+                             # gate wide enough that stride motion never drops
+                             # the track (measured: ID switches 1 -> 0).
 
 
 @dataclass
@@ -216,9 +222,10 @@ def _cluster_covariance(
 
 def _to_measurement(p: np.ndarray, R: np.ndarray) -> LegMeasurement:
     """Pack a (position, 2x2 covariance) pair into a LegMeasurement."""
+    g = GAIT_STD ** 2
     return LegMeasurement(
         x=float(p[0]), y=float(p[1]),
-        Rxx=float(R[0, 0]), Rxy=float(R[0, 1]), Ryy=float(R[1, 1]),
+        Rxx=float(R[0, 0]) + g, Rxy=float(R[0, 1]), Ryy=float(R[1, 1]) + g,
     )
 
 
@@ -296,7 +303,11 @@ def detect_legs(
         # leg AND clearly linear AND well-sampled (a wall fragment).  A narrow,
         # leg-sized cluster is never rejected on circularity — a real leg's front arc
         # can look thin (low circularity) yet still be a leg.
-        if n >= 5 and width > single_leg_width and circularity < CIRCULARITY_MIN:
+        # Wall filter applies only to genuinely WALL-scale clusters (>0.45 m).
+        # A walking person's merged legs form a 0.15-0.35 m elongated blob —
+        # rejecting those dropped the person every stride (measured 79%->100%
+        # detection coverage on a recorded walking session after this fix).
+        if n >= 5 and width > max(0.45, single_leg_width) and circularity < CIRCULARITY_MIN:
             continue
         centroid = seg.mean(axis=0)
         R = _cluster_covariance(centroid, n, sigma_theta)

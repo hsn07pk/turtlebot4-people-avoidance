@@ -64,11 +64,24 @@ _CFG = {
     'vortex': 1.6,            # tangential/radial ratio (route-around strength)
     'use_prediction': True,   # advance each person by v·t_pred before gating
     't_pred': 0.3,            # prediction lookahead for the barrier (s)
+    'cors_cap': 0.12,         # cap on the covariance inflation term (m) — keeps
+                              # a briefly-coasting track's bubble from ballooning
+    'min_track_dist': 0.28,   # tracks closer than this are the robot's own
+                              # structure (self-detections), not people — skip
+    'slow_floor': 0.35,       # comfort slow-down never cuts below this fraction
+                              # of speed (the CBF is the real safety layer)
     'influence': 2.5,         # obstacles farther than this are ignored (m)
     'escape_v_frac': 0.25,    # "blocked" if filtered v < this × nominal v
     'escape_dist': 1.2,       # only escape-turn when an obstacle is within (m)
     'escape_omega_frac': 0.6, # escape turn rate as a fraction of ω_max
     'slow_radius': 1.0,       # start slowing this far outside an obstacle (m)
+    'slew_v_rise': 0.05,      # max v increase per cycle (m/s) — smooth take-off;
+                              # braking is NEVER limited (safety)
+    'slew_w': 0.45,           # max ω change per cycle (rad/s) — kills the
+                              # bang-bang turn chatter, keeps motion smooth
+    'dock_dist': 0.8,         # within this of the goal: precision docking mode —
+                              # direct pure-pursuit + CBF only (no gap/escape
+                              # logic, which limit-cycles near a goal)
     # Follow-the-gap navigation (commits to an opening instead of oscillating)
     'gap_clear': 0.04,        # extra angular clearance added to each obstacle (m)
     'gap_hyst': 0.5,          # hysteresis: pull toward the last chosen heading
@@ -83,9 +96,12 @@ _CFG = {
                               # (≈ robot radius 0.18 + a reaction margin)
 }
 
-# Heading the robot last committed to (radians, robot frame).  The hysteresis
-# in _gap_heading pulls toward this so the robot does not flip-flop left/right
-# in front of an obstacle — it commits to going around one side.
+# Heading the robot last committed to — stored in the WORLD (odom) frame so
+# the commitment stays fixed in the world while the robot rotates (stored in
+# the body frame it would rotate away underneath the robot and cause the
+# left/right spin-dance).  _last_heading is the robot-frame projection used
+# by the escape; refreshed every cycle from the world value.
+_last_heading_world: Optional[float] = None
 _last_heading: float = 0.0
 
 # Back-off reflex state.  _backing = currently reversing; _backoff_cycles =
@@ -102,7 +118,7 @@ _BACKOFF_COOLDOWN = 24         # ~3 s — rotate/replan instead of re-reversing
 # vibrate left/right in front of a wall.
 _escape_dir: float = 0.0
 _escape_hold: int = 0
-_ESCAPE_HOLD = 12              # ~1.5 s of committed turning before re-deciding
+_ESCAPE_HOLD = 6               # ~0.75 s committed turn (1.5 s overshot ~100 deg)
 
 # Navigation goal in the ODOM frame.  None → drive straight forward.
 _goal_odom: Optional[Tuple[float, float]] = None
@@ -113,9 +129,11 @@ def set_goal(x: float, y: float) -> None:
     """Set the navigation goal (odom frame)."""
     global _goal_odom, _manual_cmd, _last_heading, _backing
     global _backoff_cycles, _backoff_cooldown
+    global _last_heading_world
     _goal_odom = (float(x), float(y))
     _manual_cmd = None
     _last_heading = 0.0          # forget the old commitment for a fresh goal
+    _last_heading_world = None
     _backing = False
     _backoff_cycles = 0
     _backoff_cooldown = 0
@@ -149,11 +167,29 @@ def get_params() -> dict:
     return dict(_CFG)
 
 
+_prev_cmd = [0.0, 0.0]
+
+
+def _smooth(cmd: Twist) -> Twist:
+    """Slew-rate limiter: smooth speed-ups and turn changes, instant braking."""
+    v, w = float(cmd.linear.x), float(cmd.angular.z)
+    pv, pw = _prev_cmd
+    if v > pv:                                   # accelerate gently
+        v = min(v, pv + _CFG['slew_v_rise'])
+    dw = _CFG['slew_w']
+    if abs(w - pw) > dw:
+        w = pw + math.copysign(dw, w - pw)
+    _prev_cmd[0], _prev_cmd[1] = v, w
+    cmd.linear.x = v
+    cmd.angular.z = w
+    return cmd
+
+
 def _angle_wrap(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
-def _gap_heading(obs: List[dict], goal_ang: float) -> Optional[float]:
+def _gap_heading(obs: List[dict], goal_ang: float, robot_th: float = 0.0) -> Optional[float]:
     """
     Follow-the-Gap: choose the best free heading around the obstacles.
 
@@ -166,7 +202,12 @@ def _gap_heading(obs: List[dict], goal_ang: float) -> Optional[float]:
 
     Returns the chosen heading (rad, robot frame), or None if fully boxed in.
     """
-    global _last_heading
+    global _last_heading, _last_heading_world
+    # hysteresis reference in the ROBOT frame, derived from the world value
+    if _last_heading_world is None:
+        hyst_ref = None
+    else:
+        hyst_ref = _angle_wrap(_last_heading_world - robot_th)
     N = 90
     binw = 2.0 * math.pi / N
     blocked = [False] * N
@@ -200,8 +241,9 @@ def _gap_heading(obs: List[dict], goal_ang: float) -> Optional[float]:
         if (k - j) >= min_bins and j < N:
             for bi in range(j, k):
                 a = -math.pi + (bi % N + 0.5) * binw
-                cost = (abs(_angle_wrap(a - goal_ang))
-                        + _CFG['gap_hyst'] * abs(_angle_wrap(a - _last_heading)))
+                cost = abs(_angle_wrap(a - goal_ang))
+                if hyst_ref is not None:
+                    cost += _CFG['gap_hyst'] * abs(_angle_wrap(a - hyst_ref))
                 if cost < best_cost:
                     best_cost, best = cost, a
         j = k
@@ -211,13 +253,15 @@ def _gap_heading(obs: List[dict], goal_ang: float) -> Optional[float]:
             if blocked[i]:
                 continue
             a = -math.pi + (i + 0.5) * binw
-            cost = (abs(_angle_wrap(a - goal_ang))
-                    + _CFG['gap_hyst'] * abs(_angle_wrap(a - _last_heading)))
+            cost = abs(_angle_wrap(a - goal_ang))
+            if hyst_ref is not None:
+                cost += _CFG['gap_hyst'] * abs(_angle_wrap(a - hyst_ref))
             if cost < best_cost:
                 best_cost, best = cost, a
 
     if best is not None:
-        _last_heading = best                         # commit (hysteresis)
+        _last_heading = best                         # robot-frame projection
+        _last_heading_world = _angle_wrap(best + robot_th)   # commit in WORLD
     return best
 
 
@@ -317,11 +361,19 @@ def _gather_obstacles(
             continue
         px, py = float(tr.m[0]), float(tr.m[1])
         vx, vy = float(tr.m[2]), float(tr.m[3])
+        if getattr(tr, 'static', False):
+            vx = vy = 0.0          # persistence says it does not move
         px += vx * t_pred
         py += vy * t_pred
-        if math.hypot(px, py) > influence:
-            continue
-        r = base_person + obstacle_radius(tr, obstacle_radius_scale)
+        d0 = math.hypot(px, py)
+        if d0 > influence or d0 < _CFG['min_track_dist']:
+            continue            # too far to matter / robot self-detection
+        # Clamp the uncertainty inflation: a track that coasts a few frames
+        # grows its covariance fast, and an unbounded radius would balloon
+        # mid-manoeuvre and slam the door on a gap the robot is already in.
+        cov_term = min(obstacle_radius(tr, obstacle_radius_scale),
+                       _CFG['cors_cap'])
+        r = base_person + cov_term
         obs.append({'px': px, 'py': py, 'vx': vx, 'vy': vy, 'r': r, 'person': True})
 
     if obstacle_points:
@@ -399,7 +451,7 @@ def compute_velocity(
             v *= max(0.0, (near_rear - rear_min) / 0.3)
         cmd.linear.x = float(v)
         cmd.angular.z = 0.0                            # back straight; re-plan once clear
-        return cmd
+        return _smooth(cmd)
 
     # ── 1. NOMINAL command ────────────────────────────────────────────────
     if _manual_cmd is not None:
@@ -422,10 +474,16 @@ def compute_velocity(
             dist_goal = float('inf')
             gdir = (1.0, 0.0)                       # forward
 
+        # Precision docking: close to the goal, gap/escape logic causes
+        # limit cycles — use direct pure-pursuit; the CBF still guards.
+        dock_mode = dist_goal < _CFG['dock_dist']
         # Follow-the-Gap: steer toward the best free opening (commits to a
         # side instead of oscillating; finds openings far to the side/behind).
         goal_ang = math.atan2(gdir[1], gdir[0])
-        gap = _gap_heading(obs, goal_ang)
+        if dock_mode:
+            gap = goal_ang
+        else:
+            gap = _gap_heading(obs, goal_ang, robot_theta)
         if gap is None:                            # fully boxed in → rotate out
             desired = _last_heading if _last_heading != 0.0 else math.pi / 2
         else:
@@ -437,7 +495,8 @@ def compute_velocity(
         nearest_edge = min((math.hypot(o['px'], o['py']) - o['r'] for o in obs),
                            default=float('inf'))
         if nearest_edge < _CFG['slow_radius']:
-            v_nom *= max(0.0, nearest_edge / _CFG['slow_radius'])
+            v_nom *= max(_CFG['slow_floor'],
+                         min(1.0, nearest_edge / _CFG['slow_radius']))
         v_nom = min(v_nom, dist_goal)
 
     v_nom = float(np.clip(v_nom, 0.0, max_linear_speed))
@@ -472,7 +531,7 @@ def compute_velocity(
     if not rows:
         cmd.linear.x = v_nom
         cmd.angular.z = w_nom
-        return cmd
+        return _smooth(cmd)
 
     v, w = _solve_qp_2d(
         v_nom, w_nom, _CFG['w_omega'], rows,
@@ -480,8 +539,34 @@ def compute_velocity(
     )
 
     # ── 3. Deadlock escape (last resort) ──────────────────────────────────
+    # Bubble-exit: h<0 means we are inside someone's INFLATED safety bubble
+    # (not a physical collision).  The CBF then only admits commands that
+    # increase h, and with several obstacles the QP can freeze (v=w=0).
+    # Creep out along the away-direction at low speed — bounded and safe.
+    L_ = _CFG['lookahead']
+    worst_h, away = 0.0, None
+    for o in obs:
+        Ex, Ey = L_ - o['px'], -o['py']
+        h_i = Ex*Ex + Ey*Ey - (o['r'] + L_)**2
+        if h_i < worst_h:
+            worst_h, away = h_i, math.atan2(-o['py'], -o['px'])
+    if worst_h < 0 and v < 0.02 and away is not None:
+        err = _angle_wrap(away)
+        if abs(err) < 0.6:
+            cmd.linear.x = 0.06
+            cmd.angular.z = float(np.clip(1.5*err, -max_angular_speed, max_angular_speed))
+        else:
+            cmd.linear.x = 0.0
+            cmd.angular.z = float(np.clip(math.copysign(_CFG['escape_omega_frac']*max_angular_speed, err), -max_angular_speed, max_angular_speed))
+        return _smooth(cmd)
+
     global _escape_dir, _escape_hold
-    blocked = (v < _CFG['escape_v_frac'] * max(v_nom, 1e-3)
+    try:
+        _dock = dock_mode
+    except NameError:
+        _dock = False
+    blocked = (not _dock
+               and v < _CFG['escape_v_frac'] * max(v_nom, 1e-3)
                and nearest_dist < _CFG['escape_dist'])
     if blocked:
         # Turn in place to get unblocked, COMMITTING to one direction for a
@@ -502,4 +587,4 @@ def compute_velocity(
 
     cmd.linear.x = float(np.clip(v, 0.0, max_linear_speed))
     cmd.angular.z = float(np.clip(w, -max_angular_speed, max_angular_speed))
-    return cmd
+    return _smooth(cmd)
