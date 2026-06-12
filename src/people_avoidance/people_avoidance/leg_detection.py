@@ -19,6 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import List, Tuple
 
+import math
 import numpy as np
 from sensor_msgs.msg import LaserScan
 
@@ -73,6 +74,10 @@ class LegMeasurement:
     Rxx: float
     Rxy: float
     Ryy: float
+    occluded: bool = False   # cluster edge is occlusion-cut (centroid suspect):
+                             # tracks may be UPDATED by it but never SPAWNED —
+                             # walking people sweep occlusion shadows along
+                             # walls, creating moving ghost clusters there
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +280,27 @@ def detect_legs(
     if points.shape[0] == 0:
         return []
 
+    # Occlusion-edge test data: for any point we can find its beam index and
+    # ask whether the neighbouring beam is SIGNIFICANTLY CLOSER — i.e. the
+    # cluster continues behind a nearer object and is occlusion-cut there.
+    # A sliding occluder (a walking person) sweeps such cut clusters along
+    # walls, producing MOVING ghost detections (measured: 38 phantom moving
+    # tracks in a 2-person session). Reject clusters cut on either edge.
+    _ranges = np.asarray(scan.ranges, dtype=float)
+    _nbeams = len(_ranges)
+
+    def _occlusion_cut(pt) -> bool:
+        ang = math.atan2(pt[1], pt[0])
+        idx = int(round((ang - scan.angle_min) / scan.angle_increment))
+        if idx < 0 or idx >= _nbeams:
+            return False
+        r_here = float(np.hypot(pt[0], pt[1]))
+        for j in (idx - 1, idx - 2, idx + 1, idx + 2):
+            if 0 <= j < _nbeams and np.isfinite(_ranges[j]):
+                if _ranges[j] < r_here - 0.30:
+                    return True
+        return False
+
     # Angular step (rad) and bearing noise sigma_theta = dtheta / sqrt(12)  [Module 1, p.30].
     dtheta = float(scan.angle_increment) if scan.angle_increment else 0.0
     if dtheta <= 0.0:
@@ -322,7 +348,8 @@ def detect_legs(
             continue
         centroid = seg.mean(axis=0)
         R = _cluster_covariance(centroid, n, sigma_theta)
-        candidates.append({'p': centroid, 'n': n, 'R': R})
+        occl = bool(_occlusion_cut(seg[0]) or _occlusion_cut(seg[-1]))
+        candidates.append({'p': centroid, 'n': n, 'R': R, 'occl': occl})
 
     if not candidates:
         return []
@@ -349,9 +376,13 @@ def detect_legs(
             used[a] = used[best] = True
             mid = 0.5 * (candidates[a]['p'] + candidates[best]['p'])
             R = 0.25 * (candidates[a]['R'] + candidates[best]['R'])
-            measurements.append(_to_measurement(mid, R))
+            mm = _to_measurement(mid, R)
+            mm.occluded = candidates[a]['occl'] and candidates[best]['occl']
+            measurements.append(mm)
         else:
             used[a] = True
-            measurements.append(_to_measurement(candidates[a]['p'], candidates[a]['R']))
+            mm = _to_measurement(candidates[a]['p'], candidates[a]['R'])
+            mm.occluded = candidates[a]['occl']
+            measurements.append(mm)
 
     return measurements

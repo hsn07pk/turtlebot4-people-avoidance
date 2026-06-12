@@ -427,6 +427,8 @@ class KalmanTracker:
         for mi, meas in enumerate(measurements):
             if mi in matched_meas_idxs or mi in self._gated_meas_idxs:
                 continue
+            if getattr(meas, 'occluded', False):
+                continue            # never BIRTH a track from a shadow-cut blob
             near_moving = False
             for t in self.tracks:
                 if not t.confirmed:
