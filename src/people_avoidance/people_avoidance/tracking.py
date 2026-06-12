@@ -123,7 +123,7 @@ class KalmanTracker:
         confirm_hits: int = 3,
         init_vel_std: float = 1.5,
         merge_dist: float = 0.35,
-        merge_vel: float = 0.3,
+        merge_vel: float = 0.45,
     ) -> None:
         """
         Args:
@@ -161,6 +161,7 @@ class KalmanTracker:
         self.init_vel_std = init_vel_std
         self.merge_dist = merge_dist
         self.merge_vel = merge_vel
+        self.coast_damp = 0.6     # per-cycle velocity decay while unmatched
         # Static-object rejection (lecture Module 4 p.198): a confirmed track
         # whose accumulated displacement stays below `static_dist` over the
         # last `static_window` scans is flagged static (chair legs, posts…).
@@ -220,9 +221,20 @@ class KalmanTracker:
             m^i_t|t-1  =  F  @  m^i_t-1
             P^i_t|t-1  =  F  @  P^i_t-1  @  F.T  +  Q
 
+        Coast damping: while a track is UNMATCHED (misses > 0) its velocity
+        decays each cycle.  A pedestrian who disappears mid-stride has most
+        likely stopped or turned (measured: at walking-direction reversals an
+        undamped track coasts away on stale velocity and is never recaptured
+        -> a fresh ID spawns).  Damped coasting keeps the track near the last
+        sighting, so the returning person falls back inside its gate.
+
         This is called automatically at the start of every update() cycle.
         """
         for track in self.tracks:
+            if track.misses > 0:
+                track.m = track.m.copy()
+                track.m[2] *= self.coast_damp
+                track.m[3] *= self.coast_damp
             track.m = self.F @ track.m
             track.P = self.F @ track.P @ self.F.T + self.Q
             # Keep P symmetric against floating-point drift.
