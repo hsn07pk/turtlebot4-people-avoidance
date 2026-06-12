@@ -168,6 +168,14 @@ class KalmanTracker:
         self.static_window = 20          # N ≈ 2 s at 10 Hz
         self.static_dist = 0.12          # δ_min (m)
         self._pos_hist: Dict[int, list] = {}
+        # Net-displacement speed clamp: leg-pairing alternation makes a
+        # standing person's centroid hop +-15 cm, which the KF reads as ~1 m/s
+        # phantom velocity (worst while the robot itself rotates).  A track
+        # whose NET displacement over the last  scans is small
+        # cannot honestly be fast — rescale its velocity to the net rate.
+        # True walkers cover real ground (rate ~ speed) and are untouched.
+        self.speed_clamp  = True
+        self.clamp_window = 8
         self.tracks: List[Track] = []
         self._next_id: int = 0
         # Measurement indices that fell inside at least one track's gate in
@@ -459,6 +467,15 @@ class KalmanTracker:
             h.append((float(t.m[0]), float(t.m[1])))
             if len(h) > self.static_window:
                 del h[0]
+            if self.speed_clamp and len(h) >= 4:
+                k = min(len(h), self.clamp_window)
+                rate = float(np.hypot(h[-1][0] - h[-k][0],
+                                      h[-1][1] - h[-k][1])) / (k * self.dt)
+                sp = float(np.hypot(t.m[2], t.m[3]))
+                if sp > max(2.0 * rate, rate + 0.15):
+                    sc = (rate / sp) if sp > 1e-6 else 0.0
+                    t.m[2] *= sc
+                    t.m[3] *= sc
             if t.confirmed and len(h) >= self.static_window:
                 dx = h[-1][0] - h[0][0]
                 dy = h[-1][1] - h[0][1]

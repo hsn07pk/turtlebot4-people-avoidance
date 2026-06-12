@@ -107,7 +107,19 @@ def _yaw(q):
 
 def on_odom(msg):
     p = msg.pose.pose
-    state['pose'] = (p.position.x, p.position.y, _yaw(p.orientation))
+    nx, ny, nth = p.position.x, p.position.y, _yaw(p.orientation)
+    if state['have_pose']:
+        ox, oy, oth = state['pose']
+        dyaw = abs(math.atan2(math.sin(nth - oth), math.cos(nth - oth)))
+        # Create3 odometry can teleport (seen: 3.82 m in one frame). Tracks
+        # live in the odom frame, so a frame jump corrupts every track —
+        # drop them and re-confirm (~0.5 s) instead of trusting garbage.
+        if math.hypot(nx - ox, ny - oy) > 0.35 or dyaw > 0.5:
+            state['tracker'] = None
+            state['trails'] = {}
+            print(f'[guard] odom teleport ({math.hypot(nx-ox,ny-oy):.2f} m, '
+                  f'{dyaw:.2f} rad) — tracker reset', flush=True)
+    state['pose'] = (nx, ny, nth)
     state['have_pose'] = True
 
 
