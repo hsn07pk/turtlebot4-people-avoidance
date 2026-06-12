@@ -399,7 +399,7 @@ def _build_sliders_html():
 
 
 HTML_HEAD = """<!doctype html><html><head><meta charset="utf-8"><title>People-Avoidance Navigation</title>
-<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<script src="/plotly.min.js"></script>
 <style>
 body{margin:0;font-family:sans-serif;background:#0e0e0e;color:#eee;display:flex}
 #plot{flex:1;height:100vh;background:#fff}
@@ -601,6 +601,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(b'ok')
         elif u.path == '/clear_goal':
             ctrl.clear_goal(); self._send(b'ok')
+        elif u.path == '/plotly.min.js':
+            try:
+                with open('/home/hassan/ros2_ws/plotly.min.js','rb') as f:
+                    self._send(f.read(), 'application/javascript')
+            except OSError:
+                self.send_error(404)
         elif u.path == '/params':
             self._send(json.dumps(params).encode(), 'application/json')
         elif u.path == '/reset':
