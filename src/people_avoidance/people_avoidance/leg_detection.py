@@ -34,6 +34,12 @@ MIN_CLUSTER_POINTS = 3       # n_min — Leigh leg_tracker / SPENCER value
 CIRCULARITY_MIN    = 0.15    # reject clearly wall-like clusters (wall ratio <~0.1) [p.123]
 PAIR_MIN_DIST      = 0.05    # min centre-to-centre to call two clusters a leg pair (m)
 COV_EPS            = 1e-9    # tiny diagonal floor so R stays positive-definite for the KF
+DETECT_MAX_RANGE   = 3.5     # legs are not detectable beyond this on our A1 in
+                             # this room: measured per-beam noise jumps from
+                             # 10 mm (2-3 m) to 180 mm median / 770 mm p90 at
+                             # 3-5 m -> far returns are ghost factories
+                             # (A/B on a 466-scan baseline: flicker cells 32->4,
+                             # tracker churn 113->17 IDs, false-moving 4->0).
 GAIT_STD           = 0.08    # gait wobble of the person-centre observation (m):
                              # legs alternate around the body centre, so the
                              # measurement noise of a PERSON position is ~8 cm,
@@ -261,6 +267,11 @@ def detect_legs(
         List of LegMeasurement.  Returns [] until students implement the body.
     """
     points = scan_to_cartesian(scan)
+    if points.shape[0] == 0:
+        return []
+    # Range cap: beyond DETECT_MAX_RANGE this sensor's returns flicker too
+    # hard to form stable leg clusters (see constant above).
+    points = points[np.hypot(points[:, 0], points[:, 1]) <= DETECT_MAX_RANGE]
     if points.shape[0] == 0:
         return []
 
