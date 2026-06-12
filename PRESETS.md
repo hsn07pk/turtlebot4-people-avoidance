@@ -69,3 +69,26 @@ lookahead L=0.30 m, γ=2.0, ω-weight 0.10 ("steer before brake"). person 0.30 m
 > max_leg_width 0.60) was hand-tuned to suppress clutter in one specific room
 > and only sees people to ~1 m. `test-1-research` detects to ~3 m and is the
 > better general choice; raise `min_points` if a noisy room produces clutter.
+
+---
+
+## Recorded-session tuning campaign (June 2026)
+
+Seven recorded lidar sessions (`/tmp/t*_*.npz`, 60–90 s each), each analyzed
+offline and A/B-tuned on the SAME data before changing any default:
+
+| # | Scenario | Key finding → default baked |
+|---|----------|------------------------------|
+| T1 | empty-ish room baseline | far clutter churn → `DETECT_MAX_RANGE 3.5 m` |
+| T2 | person at 1/2/3 m + transit | leg-split duplicate takeover → `max_leg_width 0.65`, moving-track spawn guard |
+| T3 | continuous walking, reversals | coasting-away tracks → coast damping 0.6/cycle, `q=1.0` validated (pred 8/19/50 cm @0.3/0.6/1.0 s) |
+| T4 | two people stand/cross/side-by-side | occlusion-shadow ghosts → `occluded` flag: shadow-cut clusters update tracks but never spawn them |
+| T5 | walk behind furniture, brush a bag | lidar sees under tables — full occlusion never happened; 0.4 s flicker tracks → `confirm_hits 4` |
+| T6 | robot moves, people stand | pairing alternation = ±15 cm centroid hop → phantom ~1 m/s on standing person; net-displacement speed clamp (80→39 cm/s, walkers untouched) |
+| T7 | robot moves + person walks | 99–100 % walker coverage in all robot modes, 3/5 cm prediction — defaults validated, no change |
+
+**Recorder lesson:** Create3 "odometry teleports" (3.82 m!) in recordings were
+the recorder's own /odom DDS discovery delay (pose placeholder [0,0,0] until
+first message). Recorders must gate scan capture on the first odom message.
+The dashboard keeps a 0.35 m/0.5 rad odom-jump guard as cheap insurance —
+a real frame jump corrupts every odom-frame track, so reset beats trusting it.
