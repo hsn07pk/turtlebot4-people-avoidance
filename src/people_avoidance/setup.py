@@ -15,9 +15,9 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='Instructor',
-    maintainer_email='instructor@example.com',
-    description='Skeleton people-avoidance pipeline for teaching.',
+    maintainer='Hassan',
+    maintainer_email='hsn07pk@gmail.com',
+    description='Real-time LiDAR people avoidance for the TurtleBot4.',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={

@@ -16,9 +16,9 @@ setup(
     ],
     install_requires=['setuptools'],
     zip_safe=True,
-    maintainer='Instructor',
-    maintainer_email='instructor@example.com',
-    description='Random-walk pedestrian simulator for Gazebo (teaching scaffold).',
+    maintainer='Hassan',
+    maintainer_email='hsn07pk@gmail.com',
+    description='Random-walk pedestrian simulator for Gazebo.',
     license='Apache-2.0',
     tests_require=['pytest'],
     entry_points={
