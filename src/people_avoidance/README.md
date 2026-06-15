@@ -1,9 +1,7 @@
-# people_avoidance — teaching skeleton
+# people_avoidance
 
 A ROS 2 Python package for a LiDAR-based people-avoidance pipeline.
-The node wires four stages together and runs end-to-end from day one.
-**Students fill in the four TODO stages** — the node publishes a safe zero
-command until each stage is implemented.
+The node wires the stages together and runs end-to-end from `/scan` to `/cmd_vel`.
 
 ---
 
@@ -63,7 +61,7 @@ Observation model: H = [[1,0,0,0],[0,1,0,0]] — only position is observed.
 
 ---
 
-## The four TODO stages
+## Pipeline stages
 
 ### Stage 1 — `leg_detection.py`
 

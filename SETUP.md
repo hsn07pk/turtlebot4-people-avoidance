@@ -95,7 +95,7 @@ echo $ROS_DISTRO    # jazzy  or  humble
 ## 4 — Clone and build the workspace
 
 ```bash
-git clone https://version.aalto.fi/kucnert1/ubiss_2026.git ros2_ws
+git clone https://github.com/hsn07pk/turtlebot4-people-avoidance.git ros2_ws
 cd ros2_ws
 conda deactivate
 colcon build --symlink-install
