@@ -1,25 +1,12 @@
 #!/usr/bin/env python3
-"""
-Live people-avoidance navigation dashboard (Stage 1 + 2 + 3), SPENCER-style.
+"""Live people-avoidance navigation dashboard (Stage 1+2+3).
 
-Runs the FULL pipeline on every /scan and the controller every cycle:
-
-    detect_legs()  ->  KalmanTracker.update()  ->  compute_velocity()
-
-and serves an interactive 3D control panel (open in a browser on the same
-network):
-  - 3D scene: scan points, leg detections, Kalman tracks (stems + ID labels +
-    trails + prediction ghosts), safety/influence radii, the goal, and the
-    robot's predicted path.
-  - A 2D top-down minimap: CLICK to set a navigation goal (the robot drives
-    there autonomously, avoiding walls + people and routing around them).
-  - MANUAL mode: arrow keys / WASD or on-screen buttons drive the robot,
-    still CBF-filtered so it cannot hit anything.
-  - Every detection / tracking / control setting is a live slider with a
-    hover tooltip; a "Drive robot" switch publishes /cmd_vel.
+Runs detection -> Kalman tracking -> CBF control on every /scan and serves an
+interactive 3D/2D control panel with live sliders and manual drive on port 8080.
 """
 import json
 import math
+import os
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
@@ -40,11 +27,10 @@ from people_avoidance import controller as ctrl
 
 TRAIL_LEN = 160
 
-# The RPLidar A1 on the TurtleBot4 is mounted yaw +90° relative to base_link
-# (measured from the TF base_link→rplidar_link).  The detector/tracker/
-# controller all reason as if "robot forward = laser +x", so we must rotate
-# every laser-frame point into base_link first, or the robot navigates and
-# avoids 90° off (an obstacle in front would look like it is on the side).
+# Vendored Plotly served alongside this script, so the dashboard runs offline.
+PLOTLY_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'plotly.min.js')
+
+# RPLidar A1 is mounted yaw +90° vs base_link, so rotate every laser point into base_link.
 LASER_YAW = math.pi / 2.0
 _CY, _SY = math.cos(LASER_YAW), math.sin(LASER_YAW)
 
@@ -73,7 +59,7 @@ def _to_base_meas(m):
 
 # Live-tunable parameters (sliders write here; the scan callback reads).
 params = {
-    # Stage 1 detection         (lab-tuned live on 2026-06-12)
+    # Stage 1 detection
     'dt': 0.30, 'lr': 0.10, 'mlw': 0.41, 'circ': 0.80, 'minpts': 14, 'maxr': 1.30,
     # Stage 2 tracking
     'gate': 5.40, 'q': 1.0, 'horizon': 3.0, 'vmove': 0.3,
@@ -111,9 +97,7 @@ def on_odom(msg):
     if state['have_pose']:
         ox, oy, oth = state['pose']
         dyaw = abs(math.atan2(math.sin(nth - oth), math.cos(nth - oth)))
-        # Create3 odometry can teleport (seen: 3.82 m in one frame). Tracks
-        # live in the odom frame, so a frame jump corrupts every track —
-        # drop them and re-confirm (~0.5 s) instead of trusting garbage.
+        # Create3 odometry can teleport; a frame jump corrupts odom-frame tracks, so reset.
         if math.hypot(nx - ox, ny - oy) > 0.35 or dyaw > 0.5:
             state['tracker'] = None
             state['trails'] = {}
@@ -126,9 +110,7 @@ def on_odom(msg):
 def _ensure_tracker():
     tr = state['tracker']
     if tr is None:
-        # max_misses=8 (~1 s at 7.7 Hz): standing people occasionally drop a
-        # few detections (legs merge / brief occlusion) — 5 was killing and
-        # respawning their tracks, which the user sees as a vanishing person.
+        # max_misses=8 (~1 s): standing people briefly drop detections; lower respawns their tracks.
         tr = KalmanTracker(dt=state['dt_est'], process_noise_density=params['q'],
                            gate_chi2=params['gate'], max_misses=8)
         state['tracker'] = tr
@@ -138,8 +120,7 @@ def _ensure_tracker():
 
 
 def _extract_obstacles(pts, tracks, influence, person_r):
-    """Downsample the scan to nearest point per angular sector within influence,
-    excluding points that belong to a tracked person (avoid double-counting)."""
+    """Nearest scan point per angular sector within influence, excluding tracked people."""
     if pts.shape[0] == 0:
         return []
     centers = [(float(t.m[0]), float(t.m[1])) for t in tracks if t.confirmed]
@@ -149,8 +130,7 @@ def _extract_obstacles(pts, tracks, influence, person_r):
         d = math.hypot(x, y)
         if d > influence or d < 0.12:
             continue
-        # Keep rear obstacles too — the back-off reflex needs to know whether
-        # the space behind is clear before reversing.
+        # Keep rear obstacles too: the back-off reflex checks if the space behind is clear.
         if any(math.hypot(x-cx, y-cy) < person_r for (cx, cy) in centers):
             continue
         sec = int((math.atan2(y, x) + math.pi) / (2*math.pi) * nsec)
@@ -180,20 +160,16 @@ def on_scan(scan):
     legmod.CIRCULARITY_MIN = params['circ']
     legmod.MIN_CLUSTER_POINTS = int(params['minpts'])
 
-    pts = _to_base_pts(scan_to_cartesian(scan))     # base_link frame
+    pts = _to_base_pts(scan_to_cartesian(scan))
     segs = segment_scan(pts, distance_threshold=params['dt'],
                         angle_increment=scan.angle_increment) if pts.shape[0] else []
-    # detect in the laser frame, then rotate detections into base_link.
     dets = [_to_base_meas(m) for m in
             detect_legs(scan, distance_threshold=params['dt'],
                         leg_radius=params['lr'], max_leg_width=params['mlw'])]
     # drop the robot's own mounting posts (self-detections at ~0.2 m)
     dets = [m for m in dets if math.hypot(m.x, m.y) > 0.30]
 
-    # ── ODOM-FRAME TRACKING ──────────────────────────────────────────────
-    # Track in the WORLD frame so static people stay static while the ROBOT
-    # moves (robot-frame tracking gives them phantom ego-motion velocities,
-    # which corrupt the moving-obstacle CBF and the displayed speeds).
+    # Track in the odom (world) frame so static people stay static as the robot moves.
     rx0, ry0, rth0 = state['pose']
     c0, s0 = math.cos(rth0), math.sin(rth0)
     odom_dets = []
@@ -227,7 +203,6 @@ def on_scan(scan):
 
     obstacles = _extract_obstacles(pts, tracks, params['cinf'], params['cpr'])
 
-    # Stage 3 controller, live.
     ctrl.set_params(lookahead=params['clook'], gamma=params['cgamma'],
                     w_omega=params['cwom'], person_radius=params['cpr'],
                     wall_radius=params['cwr'], robot_radius=params['crr'],
@@ -242,8 +217,7 @@ def on_scan(scan):
                                 obstacle_radius_scale=params['cors'],
                                 obstacle_points=obstacles)
     cv, cw = float(cmd.linear.x), float(cmd.angular.z)
-    # The timer (50 Hz) actually publishes — high rate so our commands win
-    # over the TB4 teleop_twist_joy_node, which floods /cmd_vel with zeros.
+    # The 50 Hz timer publishes; high rate so our commands beat TB4 teleop_twist_joy_node's zero-floods.
     state['latest_cmd'] = (cv, cw)
 
     # goal in robot frame (for drawing)
@@ -254,7 +228,6 @@ def on_scan(scan):
         dx, dy = gp[0]-rx, gp[1]-ry
         goal_robot = [round(ct*dx+st*dy, 2), round(-st*dx+ct*dy, 2)]
 
-    # track rows + trails + preds
     trails = state['trails']; rows = []; live = {}
     def _to_rob(xo_, yo_):
         dx_, dy_ = xo_ - rx0, yo_ - ry0
@@ -319,7 +292,6 @@ class PipeNode(Node):
         state['cmd_pub'].publish(tw)
 
 
-# tooltip text for every config
 TIP = {
  'dt': 'Segmentation gap floor (m). Larger merges nearby points into one cluster; smaller splits them. Adaptive threshold r·Δθ+3σ is floored by this.',
  'lr': 'Expected single-leg radius (m). Sets the leg width gate (2·lr). Calf ≈0.06 m.',
@@ -441,7 +413,7 @@ small{color:#888} .sec{margin-top:10px;border-top:1px solid #333;padding-top:6px
 
 HTML_TAIL = """
 <button onclick="fetch('/reset')" style="width:100%">Reset tracker</button>
-<div class="row" title="default = lab-tuned; test-1-research = literature + on-robot measured values (PRESETS.md)">
+<div class="row" title="default = lab-tuned; test-1-research = literature + on-robot measured values">
 <label>Config preset</label>
 <select id="preset" onchange="applyPreset()" style="width:100%;padding:6px;background:#222;color:#eee;border:1px solid #555">
  <option value="research">test-1-research</option><option value="default">default (lab-tuned)</option>
@@ -603,7 +575,7 @@ class Handler(BaseHTTPRequestHandler):
             ctrl.clear_goal(); self._send(b'ok')
         elif u.path == '/plotly.min.js':
             try:
-                with open('/home/hassan/ros2_ws/plotly.min.js','rb') as f:
+                with open(PLOTLY_PATH, 'rb') as f:
                     self._send(f.read(), 'application/javascript')
             except OSError:
                 self.send_error(404)

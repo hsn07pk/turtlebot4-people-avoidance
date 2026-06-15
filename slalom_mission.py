@@ -1,5 +1,5 @@
-"""Slalom v4: waypoint chain through the corridor axis + docking mode.
-W1=entrance -> W2=exit (pass between), W3=back-entrance -> W4=start (return)."""
+"""Scripted slalom mission for the TurtleBot4: weave through the gap between two
+detected people (W1 entrance, W2 exit), then return via W3 to the start pose."""
 import math, time, urllib.request
 import numpy as np
 import rclpy

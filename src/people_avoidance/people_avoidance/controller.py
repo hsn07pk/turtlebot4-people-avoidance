@@ -1,36 +1,12 @@
 """
-controller.py — Stage 3 of the people-avoidance pipeline.
+controller.py — Stage 3 of the people-avoidance pipeline: the avoidance
+controller. A potential-field nominal command (goal attraction + vortex
+repulsion routing around obstacles) is projected onto the safe set by a
+lookahead CBF-QP safety filter.
 
-Input : List[Track], robot pose (x, y, theta), optional scan obstacle points
-Output: geometry_msgs/Twist  published on /cmd_vel
-
-Students implement:
-  - obstacle_radius()    : derive a safety radius from track covariance
-  - compute_velocity()   : avoidance policy → linear + angular velocity command
-
-Approach — potential-field navigation + Control-Barrier-Function safety filter
-------------------------------------------------------------------------------
-Two layers, both from the UBISS 2026 control material:
-
-  1. NOMINAL (smooth routing): a potential field steers the robot toward the
-     goal while CURVING around obstacles — goal attraction + a vortex
-     repulsion from every nearby obstacle (people AND walls).  The vortex
-     (tangential) term routes the robot *around* an obstacle instead of
-     stopping in front of it, and avoids the classic head-on local minimum.
-
-  2. SAFETY (hard guarantee): the lookahead Control-Barrier-Function QP
-     (Deka "Nonlinear controls"; exp_cbf_public.ipynb) projects the nominal
-     command onto the safe set — one half-plane per obstacle:
-
-         min ‖u − u_nom‖²   s.t.   ḣ_i(x,u) + γ h_i(x) ≥ 0   ∀ obstacle i
-                                   v ∈ [0, v_max], |ω| ≤ ω_max
-
-     with the Dubins lookahead barrier  h_i = ‖P − p_i‖² − (r_i + L)²,
-     P = robot + L·heading.  People add a moving-obstacle term −2E·v_i.
-
-Frame.  Tracks and scan points arrive in the **laser/robot frame** (robot at
-the origin, heading +x), so the robot's Dubins state is (0, 0, 0) and a
-track's stored velocity is already relative to the robot.
+Tracks and scan points arrive in the laser/robot frame (robot at the origin,
+heading +x), so the robot's Dubins state is (0, 0, 0) and a track's velocity
+is already relative to the robot.
 """
 from __future__ import annotations
 
@@ -43,20 +19,14 @@ from geometry_msgs.msg import Twist
 from .tracking import Track
 
 
-# ---------------------------------------------------------------------------
 # Controller configuration (defaults; overridable via set_params)
-# ---------------------------------------------------------------------------
 _CFG = {
-    'lookahead': 0.15,        # L — virtual probe distance ahead of the robot (m).
-                              # The barrier inflates each obstacle by (r+L), so a
-                              # long L blocks tight gaps; 0.15 lets the robot
-                              # thread ~0.5 m gaps while keeping QP steering.
+    'lookahead': 0.15,        # L — probe distance ahead of robot (m); barrier inflates obstacles by (r+L)
     'gamma': 2.0,             # CBF class-K gain γ
     'w_omega': 0.1,           # QP weight on ω  (<1 ⇒ "steer before brake")
     'person_radius': 0.30,    # physical half-width of a person (m)
-    'wall_radius': 0.03,      # margin added to a scan obstacle point (m) — small
-                              # so the robot will commit to physically-passable gaps
-    'robot_radius': 0.18,     # TurtleBot4 footprint radius (m) — the hard floor
+    'wall_radius': 0.03,      # margin added to each scan obstacle point (m)
+    'robot_radius': 0.18,     # TurtleBot4 footprint radius (m)
     'goal_tolerance': 0.20,   # stop when within this distance of the goal (m)
     'k_omega': 1.5,           # heading-error gain for ω_nom
     'k_att': 1.0,             # goal attraction weight (potential field)
@@ -64,53 +34,40 @@ _CFG = {
     'vortex': 1.6,            # tangential/radial ratio (route-around strength)
     'use_prediction': True,   # advance each person by v·t_pred before gating
     't_pred': 0.3,            # prediction lookahead for the barrier (s)
-    'cors_cap': 0.12,         # cap on the covariance inflation term (m) — keeps
-                              # a briefly-coasting track's bubble from ballooning
-    'min_track_dist': 0.28,   # tracks closer than this are the robot's own
-                              # structure (self-detections), not people — skip
-    'slow_floor': 0.35,       # comfort slow-down never cuts below this fraction
-                              # of speed (the CBF is the real safety layer)
+    'cors_cap': 0.12,         # cap on the covariance inflation term (m)
+    'min_track_dist': 0.28,   # tracks closer than this are self-detections, not people (m)
+    'slow_floor': 0.35,       # comfort slow-down never cuts below this fraction of speed
     'influence': 2.5,         # obstacles farther than this are ignored (m)
     'escape_v_frac': 0.25,    # "blocked" if filtered v < this × nominal v
     'escape_dist': 1.2,       # only escape-turn when an obstacle is within (m)
     'escape_omega_frac': 0.6, # escape turn rate as a fraction of ω_max
     'slow_radius': 1.0,       # start slowing this far outside an obstacle (m)
-    'slew_v_rise': 0.05,      # max v increase per cycle (m/s) — smooth take-off;
-                              # braking is NEVER limited (safety)
-    'slew_w': 0.45,           # max ω change per cycle (rad/s) — kills the
-                              # bang-bang turn chatter, keeps motion smooth
-    'dock_dist': 0.8,         # within this of the goal: precision docking mode —
-                              # direct pure-pursuit + CBF only (no gap/escape
-                              # logic, which limit-cycles near a goal)
-    # Follow-the-gap navigation (commits to an opening instead of oscillating)
+    'slew_v_rise': 0.05,      # max v increase per cycle (m/s); braking is never limited (safety)
+    'slew_w': 0.45,           # max ω change per cycle (rad/s)
+    'dock_dist': 0.8,         # within this of the goal, use precision docking: pure-pursuit + CBF only (m)
+    # Follow-the-gap navigation
     'gap_clear': 0.04,        # extra angular clearance added to each obstacle (m)
     'gap_hyst': 0.5,          # hysteresis: pull toward the last chosen heading
-    'gap_min_deg': 4.0,       # ignore only single-bin noise — a FAR gap is
-                              # angularly thin even when the robot easily fits
-                              # (the obstacle shadows already encode clearance)
+    'gap_min_deg': 4.0,       # minimum gap width to consider (deg); ignores single-bin noise
     # Back-off reflex: reverse out of the danger zone (e.g. a foot in front)
     'backoff_trigger': 0.38,  # reverse when nearest front obstacle is within (m)
     'backoff_clear': 0.60,    # stop reversing once it is beyond this (m, hysteresis)
     'backoff_speed': 0.10,    # reverse speed (m/s)
-    'backoff_rear_min': 0.50, # only reverse if the space behind is clearer than (m)
-                              # (≈ robot radius 0.18 + a reaction margin)
+    'backoff_rear_min': 0.50, # only reverse if the rear space is clearer than this (m)
 }
 
-# Heading the robot last committed to — stored in the WORLD (odom) frame so
-# the commitment stays fixed in the world while the robot rotates (stored in
-# the body frame it would rotate away underneath the robot and cause the
-# left/right spin-dance).  _last_heading is the robot-frame projection used
-# by the escape; refreshed every cycle from the world value.
+# Last committed heading, stored in the WORLD (odom) frame so the commitment
+# stays fixed while the robot rotates (in the body frame it would rotate away
+# and cause left/right spin). _last_heading is the robot-frame projection.
 _last_heading_world: Optional[float] = None
 _spin_dir: Optional[float] = None     # committed turn-in-place direction
 
 
 def _commit_spin(cmd, heading_err, w_max):
-    """Latch ONE rotation direction while turning in place toward a far-off
-    heading.  At v=0 the CBF rows and bubble-exit pick omega's sign from
-    whichever obstacle is momentarily 'worst', which dithers +-w forever when
-    the goal is behind (live slalom HOME failure: 107 sign flips, 75 s stuck).
-    Pure rotation of a round robot is collision-free, so sign override is safe."""
+    """Latch one rotation direction while turning in place toward a far-off
+    heading. At v=0 the CBF picks omega's sign from the momentarily-worst
+    obstacle, which dithers ±ω forever when the goal is behind. Pure rotation
+    of a round robot is collision-free, so the sign override is safe."""
     global _spin_dir
     if heading_err is None:
         _spin_dir = None
@@ -125,21 +82,19 @@ def _commit_spin(cmd, heading_err, w_max):
     return cmd
 _last_heading: float = 0.0
 
-# Back-off reflex state.  _backing = currently reversing; _backoff_cycles =
-# how long it has been reversing (anti-latch); _backoff_cooldown = blocks
-# re-triggering for a while after a latched back-off is force-aborted.
+# Back-off reflex state: _backing = currently reversing, _backoff_cycles =
+# reversing duration (anti-latch), _backoff_cooldown = blocks re-triggering.
 _backing: bool = False
 _backoff_cycles: int = 0
 _backoff_cooldown: int = 0
-_BACKOFF_MAX_CYCLES = 16       # ~2 s at 8 Hz — give up reversing after this
-_BACKOFF_COOLDOWN = 24         # ~3 s — rotate/replan instead of re-reversing
+_BACKOFF_MAX_CYCLES = 16       # ~2 s at 8 Hz
+_BACKOFF_COOLDOWN = 24         # ~3 s at 8 Hz
 
-# Escape (turn-in-place) state.  Once the robot starts turning one way to get
-# unblocked it COMMITS to that direction for _ESCAPE_HOLD cycles, so it cannot
-# vibrate left/right in front of a wall.
+# Escape (turn-in-place) state: once turning one way, commit to that direction
+# for _ESCAPE_HOLD cycles so the robot cannot vibrate left/right.
 _escape_dir: float = 0.0
 _escape_hold: int = 0
-_ESCAPE_HOLD = 6               # ~0.75 s committed turn (1.5 s overshot ~100 deg)
+_ESCAPE_HOLD = 6               # ~0.75 s committed turn at 8 Hz
 
 # Navigation goal in the ODOM frame.  None → drive straight forward.
 _goal_odom: Optional[Tuple[float, float]] = None
@@ -168,8 +123,7 @@ def clear_goal() -> None:
 
 
 def set_manual(v: float, omega: float) -> None:
-    """Manual-drive intent (robot frame): the nominal becomes this (v, ω),
-    still filtered by the CBF so manual driving cannot hit anything."""
+    """Manual-drive intent (robot frame): nominal becomes this (v, ω), still CBF-filtered."""
     global _manual_cmd, _goal_odom
     _manual_cmd = (float(v), float(omega))
     _goal_odom = None
@@ -196,7 +150,7 @@ def _smooth(cmd: Twist) -> Twist:
     """Slew-rate limiter: smooth speed-ups and turn changes, instant braking."""
     v, w = float(cmd.linear.x), float(cmd.angular.z)
     pv, pw = _prev_cmd
-    if v > pv:                                   # accelerate gently
+    if v > pv:
         v = min(v, pv + _CFG['slew_v_rise'])
     dw = _CFG['slew_w']
     if abs(w - pw) > dw:
@@ -212,18 +166,9 @@ def _angle_wrap(a: float) -> float:
 
 
 def _gap_heading(obs: List[dict], goal_ang: float, robot_th: float = 0.0) -> Optional[float]:
-    """
-    Follow-the-Gap: choose the best free heading around the obstacles.
-
-    Each obstacle blocks an angular wedge (its safety disk seen from the
-    robot).  Among the free openings wide enough for the robot, pick the
-    heading that best trades off proximity to the goal direction against a
-    HYSTERESIS pull toward the last committed heading — so the robot commits
-    to going around one side instead of oscillating, and will turn toward an
-    opening that is far to the side or behind it.
-
-    Returns the chosen heading (rad, robot frame), or None if fully boxed in.
-    """
+    """Follow-the-Gap: pick the best free heading around the obstacles, trading
+    goal-direction proximity against hysteresis toward the last committed heading.
+    Returns the chosen heading (rad, robot frame), or None if fully boxed in."""
     global _last_heading, _last_heading_world
     # hysteresis reference in the ROBOT frame, derived from the world value
     if _last_heading_world is None:
@@ -287,26 +232,13 @@ def _gap_heading(obs: List[dict], goal_ang: float, robot_th: float = 0.0) -> Opt
     return best
 
 
-# ---------------------------------------------------------------------------
-# Stage 3a — uncertainty-aware obstacle radius
-# ---------------------------------------------------------------------------
-
 def obstacle_radius(track: Track, sigma_scale: float) -> float:
-    """
-    Conservative obstacle radius from the track's positional uncertainty:
-
-        radius = sigma_scale × √(λ_max(P[:2, :2]))
-
-    Grows while the Kalman filter is uncertain, shrinks as it converges.
-    """
+    """Conservative obstacle radius from the track's positional uncertainty:
+    radius = sigma_scale × √(λ_max(P[:2, :2])). Grows with filter uncertainty."""
     pos_cov = np.asarray(track.P)[:2, :2]
     lambda_max = float(np.linalg.eigvalsh(pos_cov)[-1])
     return float(sigma_scale) * math.sqrt(max(lambda_max, 0.0))
 
-
-# ---------------------------------------------------------------------------
-# Tiny exact 2-variable QP  (no external solver dependency)
-# ---------------------------------------------------------------------------
 
 def _solve_qp_2d(
     v_nom: float, w_nom: float, w_omega: float,
@@ -362,10 +294,6 @@ def _solve_qp_2d(
     return float(best[0]), float(best[1]) / sw
 
 
-# ---------------------------------------------------------------------------
-# Obstacle assembly: people (dynamic) + scan points (static)
-# ---------------------------------------------------------------------------
-
 def _gather_obstacles(
     tracks: List[Track],
     obstacle_points: Optional[Sequence[Tuple[float, float]]],
@@ -390,9 +318,7 @@ def _gather_obstacles(
         d0 = math.hypot(px, py)
         if d0 > influence or d0 < _CFG['min_track_dist']:
             continue            # too far to matter / robot self-detection
-        # Clamp the uncertainty inflation: a track that coasts a few frames
-        # grows its covariance fast, and an unbounded radius would balloon
-        # mid-manoeuvre and slam the door on a gap the robot is already in.
+        # Clamp uncertainty inflation so a coasting track's bubble can't balloon mid-manoeuvre.
         cov_term = min(obstacle_radius(tr, obstacle_radius_scale),
                        _CFG['cors_cap'])
         r = base_person + cov_term
@@ -408,10 +334,6 @@ def _gather_obstacles(
     return obs
 
 
-# ---------------------------------------------------------------------------
-# Stage 3b — avoidance policy
-# ---------------------------------------------------------------------------
-
 def compute_velocity(
     tracks: List[Track],
     robot_x: float,
@@ -422,28 +344,21 @@ def compute_velocity(
     obstacle_radius_scale: float = 2.0,
     obstacle_points: Optional[Sequence[Tuple[float, float]]] = None,
 ) -> Twist:
-    """
-    Velocity command: navigate toward the goal while avoiding people AND
-    static obstacles (walls/furniture from the scan), routing AROUND them.
+    """Velocity command: navigate toward the goal while avoiding people and
+    static obstacles, routing around them.
 
-    See module docstring.  `obstacle_points` is an optional list of (x, y)
-    static obstacle points in the robot frame (downsampled scan returns);
-    when omitted the controller avoids only the tracked people (the node's
-    default behaviour).
+    `obstacle_points` is an optional list of (x, y) static obstacle points in
+    the robot frame (downsampled scan returns); when omitted, only tracked
+    people are avoided.
     """
     cmd = Twist()
     L = _CFG['lookahead']
     obs = _gather_obstacles(tracks, obstacle_points, obstacle_radius_scale)
 
-    # ── 0. Back-off reflex ────────────────────────────────────────────────
-    # If an obstacle sits in the danger zone DIRECTLY ahead (a foot stepping in
-    # front) and there is room behind, REVERSE out until clear — then the
-    # normal navigation finds a way around.  Guards against the two ways this
-    # could go wrong: (a) a NARROW ±35° cone so gap-edge walls (off to the
-    # side as the robot enters an opening) do NOT trigger it, and (b) an
-    # anti-latch — if it cannot make progress within _BACKOFF_MAX_CYCLES it
-    # gives up reversing and lets the navigation rotate to find another way,
-    # with a cooldown so it does not immediately re-reverse.
+    # 0. Back-off reflex: if an obstacle sits in the danger zone directly ahead
+    # and there is room behind, reverse out until clear. A narrow ±35° cone
+    # avoids triggering on gap-edge walls; an anti-latch gives up after
+    # _BACKOFF_MAX_CYCLES with a cooldown so it does not immediately re-reverse.
     global _backing, _backoff_cycles, _backoff_cooldown
     front = [math.hypot(o['px'], o['py']) for o in obs
              if abs(math.atan2(o['py'], o['px'])) < math.radians(35)]
@@ -475,7 +390,7 @@ def compute_velocity(
         cmd.angular.z = 0.0                            # back straight; re-plan once clear
         return _smooth(cmd)
 
-    # ── 1. NOMINAL command ────────────────────────────────────────────────
+    # 1. Nominal command
     heading_err = None
     if _manual_cmd is not None:
         # Manual drive: take the operator's (v, ω) as the nominal.
@@ -497,11 +412,10 @@ def compute_velocity(
             dist_goal = float('inf')
             gdir = (1.0, 0.0)                       # forward
 
-        # Precision docking: close to the goal, gap/escape logic causes
-        # limit cycles — use direct pure-pursuit; the CBF still guards.
+        # Precision docking near the goal: direct pure-pursuit (CBF still
+        # guards), since gap/escape logic limit-cycles here.
         dock_mode = dist_goal < _CFG['dock_dist']
-        # Follow-the-Gap: steer toward the best free opening (commits to a
-        # side instead of oscillating; finds openings far to the side/behind).
+        # Follow-the-Gap: steer toward the best free opening.
         goal_ang = math.atan2(gdir[1], gdir[0])
         if dock_mode:
             gap = goal_ang
@@ -525,7 +439,7 @@ def compute_velocity(
     v_nom = float(np.clip(v_nom, 0.0, max_linear_speed))
     w_nom = float(np.clip(w_nom, -max_angular_speed, max_angular_speed))
 
-    # ── 2. CBF safety constraints, one row per obstacle ───────────────────
+    # 2. CBF safety constraints, one row per obstacle
     rows: List[Tuple[float, float, float]] = []
     gamma = _CFG['gamma']
     nearest_dist = float('inf')
@@ -561,11 +475,10 @@ def compute_velocity(
         v_min=0.0, v_max=max_linear_speed, w_max=max_angular_speed,
     )
 
-    # ── 3. Deadlock escape (last resort) ──────────────────────────────────
-    # Bubble-exit: h<0 means we are inside someone's INFLATED safety bubble
-    # (not a physical collision).  The CBF then only admits commands that
-    # increase h, and with several obstacles the QP can freeze (v=w=0).
-    # Creep out along the away-direction at low speed — bounded and safe.
+    # 3. Deadlock escape (last resort).
+    # Bubble-exit: h<0 means we are inside an inflated safety bubble (not a
+    # physical collision); the CBF can then freeze the QP at v=w=0. Creep out
+    # along the away-direction at low speed — bounded and safe.
     L_ = _CFG['lookahead']
     worst_h, away = 0.0, None
     for o in obs:
@@ -592,10 +505,8 @@ def compute_velocity(
                and v < _CFG['escape_v_frac'] * max(v_nom, 1e-3)
                and nearest_dist < _CFG['escape_dist'])
     if blocked:
-        # Turn in place to get unblocked, COMMITTING to one direction for a
-        # stretch so the robot cannot vibrate left/right.  The committed
-        # direction is chosen once (toward the gap heading, else the less-
-        # crowded side) and held for _ESCAPE_HOLD cycles.
+        # Turn in place to get unblocked, committing to one direction for
+        # _ESCAPE_HOLD cycles so the robot cannot vibrate left/right.
         if _escape_hold <= 0:
             if abs(_last_heading) > 1e-3:
                 _escape_dir = 1.0 if _last_heading > 0 else -1.0

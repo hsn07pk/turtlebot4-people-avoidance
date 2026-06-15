@@ -1,57 +1,5 @@
-"""
-people_avoidance_node.py — ROS 2 node that wires the pipeline together.
-
-Data flow (triggered by each incoming /scan message):
-
-    /scan  ──► detect_legs()      ──► List[LegMeasurement]
-                                           │
-                                    tracker.update()
-                                           │
-                                     List[Track]
-                                           │
-                                  compute_velocity()  ◄──  robot pose (/odom)
-                                           │
-                                        /cmd_vel
-
-The node wires the stages; the stage bodies are stubs until students fill them in.
-With all stubs in place the node publishes a zero Twist on /cmd_vel — safe to run
-from day one without any implementation.
-
-Robot pose source
------------------
-Pose is read from nav_msgs/Odometry on the `odom_topic` parameter (default: /odom).
-Odometry provides the robot pose in the odom frame, which is also the frame in
-which tracks are maintained — so no additional transform is required for the
-controller.
-
-For deployment beyond the simulator (e.g. with SLAM), replace the odometry
-subscription with a TF lookup:
-
-    import tf2_ros
-    self.tf_buffer   = tf2_ros.Buffer()
-    self.tf_listener = tf2_ros.TransformListener(self.tf_buffer, self)
-    # In _scan_cb:
-    t = self.tf_buffer.lookup_transform(odom_frame, base_frame, rclpy.time.Time())
-    robot_x     = t.transform.translation.x
-    robot_y     = t.transform.translation.y
-    robot_theta = _yaw_from_quaternion(t.transform.rotation.{x,y,z,w})
-
-ROS 2 Parameters (tune at launch; no code changes required)
------------------------------------------------------------
-scan_topic              str    /scan          LaserScan input topic
-cmd_vel_topic           str    /cmd_vel       Twist output topic
-odom_topic              str    /odom          Odometry pose topic
-laser_frame             str    base_scan      Laser sensor frame id (reference only)
-odom_frame              str    odom           Odometry/world frame id (reference only)
-dt                      float  0.1            KF time step (s); match to scan rate
-max_misses              int    5              Frames before a track is deleted
-distance_threshold      float  0.1            Segmentation gap (m)
-leg_radius              float  0.10           Expected single-leg radius (m)
-max_leg_width           float  0.25           Max leg-pair separation (m)
-max_linear_speed        float  0.2            Forward speed cap (m/s)
-max_angular_speed       float  1.0            Rotation rate cap (rad/s)
-obstacle_radius_scale   float  2.0            Uncertainty inflation factor k
-"""
+"""ROS 2 node for people avoidance: subscribes to /scan and /odom, runs leg
+detection → Kalman tracking → avoidance control, and publishes /cmd_vel."""
 from __future__ import annotations
 
 import math
@@ -63,10 +11,7 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from sensor_msgs.msg import LaserScan
 
-# The TurtleBot4 publishes /scan and /odom with BEST_EFFORT (SensorData) QoS.
-# A default (RELIABLE) subscriber is QoS-incompatible and receives NOTHING from
-# the real robot — the node would spin forever publishing zeros.  Subscribe
-# with BEST_EFFORT so the pipeline actually receives sensor data on hardware.
+# Real TurtleBot4 /scan and /odom use BEST_EFFORT (SensorData) QoS; a RELIABLE subscriber receives nothing.
 _SENSOR_QOS = QoSProfile(depth=10,
                          reliability=ReliabilityPolicy.BEST_EFFORT,
                          history=HistoryPolicy.KEEP_LAST)
@@ -77,10 +22,8 @@ from .controller import compute_velocity
 
 
 def _rotate_measurements(measurements, yaw):
-    """Rotate laser-frame LegMeasurements into base_link by the lidar mount yaw.
-    The RPLidar A1 on the TurtleBot4 is mounted yaw +90° vs base_link, so the
-    detector/tracker/controller (which assume robot forward = +x) need the
-    measurements rotated, else the robot navigates and avoids 90° off."""
+    """Rotate laser-frame measurements into base_link by the lidar mount yaw.
+    The TurtleBot4 RPLidar is mounted +90° vs base_link; without this the robot avoids 90° off."""
     if abs(yaw) < 1e-6:
         return measurements
     c, s = math.cos(yaw), math.sin(yaw)
@@ -101,7 +44,6 @@ class PeopleAvoidanceNode(Node):
     def __init__(self) -> None:
         super().__init__('people_avoidance_node')
 
-        # ── Declare all tunable parameters ───────────────────────────────────
         self.declare_parameter('scan_topic',            '/scan')
         self.declare_parameter('cmd_vel_topic',         '/cmd_vel')
         self.declare_parameter('odom_topic',            '/odom')
@@ -119,30 +61,24 @@ class PeopleAvoidanceNode(Node):
 
         p = self._params()
 
-        # ── Kalman tracker (shared state across scans) ────────────────────────
         self.tracker = KalmanTracker(
             dt=p['dt'],
             max_misses=p['max_misses'],
         )
 
-        # ── Latest robot pose — updated from /odom, consumed on each /scan ───
         self._robot_x:     float = 0.0
         self._robot_y:     float = 0.0
         self._robot_theta: float = 0.0
 
-        # ── Subscriptions ─────────────────────────────────────────────────────
         self.create_subscription(LaserScan, p['scan_topic'], self._scan_cb, _SENSOR_QOS)
         self.create_subscription(Odometry,  p['odom_topic'], self._odom_cb, _SENSOR_QOS)
 
-        # ── Publisher ─────────────────────────────────────────────────────────
         self._cmd_pub = self.create_publisher(Twist, p['cmd_vel_topic'], 10)
 
         self.get_logger().info(
             f"PeopleAvoidanceNode ready — "
             f"listening on '{p['scan_topic']}', publishing to '{p['cmd_vel_topic']}'"
         )
-
-    # ── Callbacks ─────────────────────────────────────────────────────────────
 
     def _odom_cb(self, msg: Odometry) -> None:
         """Cache the latest robot pose from odometry."""
@@ -159,21 +95,17 @@ class PeopleAvoidanceNode(Node):
         """Main pipeline callback — fires on every incoming LaserScan."""
         p = self._params()
 
-        # ── Stage 1: leg detection ────────────────────────────────────────────
         measurements = detect_legs(
             scan,
             distance_threshold=p['distance_threshold'],
             leg_radius=p['leg_radius'],
             max_leg_width=p['max_leg_width'],
         )
-        # Rotate laser-frame detections into base_link (lidar mount offset).
         measurements = _rotate_measurements(measurements, p['laser_yaw_offset'])
 
-        # ── Stage 2: Kalman tracking ──────────────────────────────────────────
         self.tracker.update(measurements)
         tracks = self.tracker.get_tracks()
 
-        # ── Stage 3: avoidance control ────────────────────────────────────────
         cmd = compute_velocity(
             tracks,
             robot_x=self._robot_x,
@@ -190,8 +122,6 @@ class PeopleAvoidanceNode(Node):
             f"{len(measurements)} detections  {len(tracks)} tracks  "
             f"→  v={cmd.linear.x:.2f} m/s  ω={cmd.angular.z:.2f} rad/s"
         )
-
-    # ── Helper ────────────────────────────────────────────────────────────────
 
     def _params(self) -> dict:
         return {
@@ -211,10 +141,6 @@ class PeopleAvoidanceNode(Node):
             'obstacle_radius_scale': self.get_parameter('obstacle_radius_scale').value,
         }
 
-
-# ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
 
 def _yaw_from_quaternion(qx: float, qy: float, qz: float, qw: float) -> float:
     """Extract yaw (rotation about Z) from a unit quaternion."""

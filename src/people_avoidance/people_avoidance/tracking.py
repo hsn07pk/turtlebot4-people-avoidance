@@ -1,34 +1,9 @@
 """
-tracking.py — Stage 2 of the people-avoidance pipeline.
+Stage 2: multi-target constant-velocity Kalman filter with gated
+nearest-neighbour data association, track lifecycle, and merging.
 
-Input : List[LegMeasurement]  (one per scan, from leg_detection.py)
-Output: List[Track]           (maintained across scans)
-
-Each track i models one person as a Gaussian:
-    X^i_t ~ N(m^i_t, P^i_t)
-
-State vector  m = [x, y, vx, vy]   (position + velocity in the **laser/robot
-frame** — measurements come from leg_detection in the laser frame and are not
-transformed, so the controller treats the robot as the origin).
-Covariance    P is 4 × 4.
-
-Students implement:
-  - KalmanTracker.__init__()   : define F and Q
-  - KalmanTracker.predict()    : constant-velocity propagation
-  - KalmanTracker.associate()  : measurement-to-track matching
-  - KalmanTracker.update()     : KF update + track lifecycle management
-
-Implementation follows the UBISS 2026 course material:
-  - Särkkä, "Bayesian and Kalman filtering" + "Dynamics and measurements":
-    Wiener-velocity (constant-velocity) model with the exact discretized
-    process noise Q(dt) used in the course's 2d_kalman_demo.ipynb.
-  - Särkkä, "Multiple target tracking" (pp. 31–33): one KF per target,
-    Mahalanobis distance d² = vᵀS⁻¹v as association cost, gating, and joint
-    assignment with the Hungarian algorithm; tracks deleted after going
-    too long without an update.
-  - Kucner, "2D LiDAR People Detection" Module 4: χ²₂ Mahalanobis gate
-    (γ = 9.21, the 99 % entry of the lecture's Eq. 7 table — see __init__),
-    track lifecycle NEW →(3 hits)→ CONFIRMED, delete after 5 misses.
+State m = [x, y, vx, vy] in the laser/robot frame; covariance P is 4x4.
+Input: List[LegMeasurement] per scan; output: List[Track] across scans.
 """
 from __future__ import annotations
 
@@ -41,37 +16,22 @@ from scipy.optimize import linear_sum_assignment
 from .leg_detection import LegMeasurement
 
 
-# ---------------------------------------------------------------------------
-# Data structures
-# ---------------------------------------------------------------------------
-
 @dataclass
 class Track:
     """
-    Single-person track: state X^i_t ~ N(m^i_t, P^i_t).
+    Single-person track: state X ~ N(m, P), position-only observation.
 
     Attributes
     ----------
     m        : Mean state vector [x, y, vx, vy], shape (4,).
     P        : State covariance matrix, shape (4, 4).
     track_id : Unique integer identifier assigned at track creation.
-    misses   : Number of consecutive scans without a matched measurement.
-               The tracker deletes a track when misses > max_misses.
-    hits     : Number of consecutive scans with a matched measurement
-               (reset to 0 on a miss).
-    confirmed: Latched True once hits reaches the confirmation threshold
-               (lecture Module 4: NEW →(H_conf consecutive hits)→ CONFIRMED).
-               Lets downstream stages ignore single-frame ghost detections.
-
-    Observation model
-    -----------------
-    Only position is observed.  The measurement matrix H projects the 4-D
-    state to a 2-D observation:
-
-        H = [[1, 0, 0, 0],
-             [0, 1, 0, 0]]
-
-    so that  z = H @ m + noise,  noise ~ N(0, R).
+    misses   : Consecutive scans without a matched measurement; the track is
+               deleted when misses > max_misses.
+    hits     : Consecutive scans with a matched measurement (reset to 0 on a miss).
+    confirmed: Latched True once hits reaches the confirmation threshold; lets
+               downstream stages ignore single-frame ghost detections.
+    static   : True once persistence shows the track has not moved.
     """
     m:         np.ndarray   # shape (4,): [x, y, vx, vy]
     P:         np.ndarray   # shape (4, 4)
@@ -80,32 +40,10 @@ class Track:
     hits:      int = 0
     confirmed: bool = False
     static:    bool = False   # True once persistence shows it has not moved
-                              # (lecture Module 4 p.198: static-object rejection)
 
-
-# ---------------------------------------------------------------------------
-# Kalman tracker
-# ---------------------------------------------------------------------------
 
 class KalmanTracker:
-    """
-    Multi-target constant-velocity Kalman filter with data association.
-
-    Lifecycle of each call to update()
-    -----------------------------------
-    1. predict()    — propagate all tracks forward by dt.
-    2. associate()  — match measurements to tracks.
-    3. KF update    — correct matched tracks with measurements.
-    4. Spawn        — create new tracks for unmatched measurements.
-    5. Prune        — delete tracks that have been missed too many times.
-
-    Typical usage
-    -------------
-    tracker = KalmanTracker(dt=0.1)
-    for measurements in scan_stream:          # measurements: List[LegMeasurement]
-        tracker.update(measurements)
-        active_tracks = tracker.get_tracks()  # List[Track]
-    """
+    """Multi-target constant-velocity Kalman filter with gated NN data association."""
 
     # Observation matrix H: extracts (x, y) from the 4-D state.
     H: np.ndarray = np.array(
@@ -130,29 +68,16 @@ class KalmanTracker:
             dt:         Time step between scans (seconds).
             max_misses: Delete a track after this many consecutive missed frames.
             process_noise_density:
-                        Spectral density q of the white-noise acceleration
-                        (m²/s³).  q = 1.0 matches the course 2d_kalman_demo;
-                        larger q lets tracks follow manoeuvres faster at the
-                        cost of noisier velocity estimates.
-            gate_chi2:  Mahalanobis gate γ on d².  Innovations are 2-D, so
-                        d² ~ χ²₂ under a correct association.  γ = 9.21 (99 %,
-                        lecture Eq. 7 table).  With centimetre-level R the
-                        95 % gate (5.99) is only ~12 cm wide — a track whose
-                        velocity is still converging overshoots it and spawns
-                        duplicate tracks; 99 % trades a negligible clutter
-                        acceptance for robust association.
-            confirm_hits:
-                        Consecutive hits needed to mark a track confirmed
-                        (lecture Module 4: H_conf = 3).
-            init_vel_std:
-                        1σ uncertainty on the (unobserved) initial velocity
-                        of a new track (m/s).  ~1 m/s covers walking people.
+                        Spectral density q of the white-noise acceleration (m²/s³);
+                        larger q follows manoeuvres faster but noisier.
+            gate_chi2:  Mahalanobis gate γ on d² (innovations are 2-D, d² ~ χ²₂);
+                        9.21 ≈ the 99% quantile.
+            confirm_hits: Consecutive hits needed to mark a track confirmed.
+            init_vel_std: 1σ prior on the unobserved initial velocity (m/s).
             merge_dist / merge_vel:
                         Two tracks closer than merge_dist (m) with velocities
-                        within merge_vel (m/s) are duplicates of one target
-                        and get merged (lecture: "track merging").  The
-                        velocity guard keeps genuinely crossing people apart —
-                        their tracks meet in position but not in velocity.
+                        within merge_vel (m/s) are merged as one target; the
+                        velocity guard keeps crossing people apart.
         """
         self.dt = dt
         self.max_misses = max_misses
@@ -162,32 +87,23 @@ class KalmanTracker:
         self.merge_dist = merge_dist
         self.merge_vel = merge_vel
         self.coast_damp = 0.6     # per-cycle velocity decay while unmatched
-        # Static-object rejection (lecture Module 4 p.198): a confirmed track
-        # whose accumulated displacement stays below `static_dist` over the
-        # last `static_window` scans is flagged static (chair legs, posts…).
+        # Static-object rejection: flag a confirmed track static when its
+        # displacement over the last static_window scans stays below static_dist.
         self.static_window = 20          # N ≈ 2 s at 10 Hz
-        self.static_dist = 0.12          # δ_min (m)
+        self.static_dist = 0.12          # metres
         self._pos_hist: Dict[int, list] = {}
-        # Net-displacement speed clamp: leg-pairing alternation makes a
-        # standing person's centroid hop +-15 cm, which the KF reads as ~1 m/s
-        # phantom velocity (worst while the robot itself rotates).  A track
-        # whose NET displacement over the last  scans is small
-        # cannot honestly be fast — rescale its velocity to the net rate.
-        # True walkers cover real ground (rate ~ speed) and are untouched.
+        # Net-displacement speed clamp: a near-stationary centroid that hops
+        # (leg-pairing alternation) reads as phantom velocity; rescale a track's
+        # velocity to its net displacement rate when the two disagree.
         self.speed_clamp  = True
         self.clamp_window = 8
         self.tracks: List[Track] = []
         self._next_id: int = 0
-        # Measurement indices that fell inside at least one track's gate in
-        # the most recent associate() call — used by the spawn rule.
+        # Measurement indices that fell inside at least one track's gate in the
+        # most recent associate() call; used by the spawn rule.
         self._gated_meas_idxs: set = set()
 
-        # Constant-velocity (Wiener velocity) state transition:
-        #
-        #     F = [[1, 0, dt,  0],
-        #          [0, 1,  0, dt],
-        #          [0, 0,  1,  0],
-        #          [0, 0,  0,  1]]
+        # Constant-velocity (Wiener-velocity) state transition.
         self.F = np.array(
             [[1.0, 0.0,  dt, 0.0],
              [0.0, 1.0, 0.0,  dt],
@@ -196,17 +112,9 @@ class KalmanTracker:
             dtype=float,
         )
 
-        # Process noise covariance Q — the exact discretization of the
-        # continuous white-noise-acceleration model (Särkkä, "Dynamics and
-        # measurements" p. 24; identical to the course 2d_kalman_demo):
-        #
-        #     Q = q · [[dt³/3,     0, dt²/2,     0],
-        #              [    0, dt³/3,     0, dt²/2],
-        #              [dt²/2,     0,    dt,     0],
-        #              [    0, dt²/2,     0,    dt]]
-        #
-        # The dt³/dt² coupling terms tie position noise to velocity noise,
-        # which a plain diagonal Q ignores.
+        # Exact discretized white-noise-acceleration process noise Q: the
+        # dt³/3, dt²/2 coupling ties position noise to velocity noise (a plain
+        # diagonal Q ignores it).
         q = process_noise_density
         self.Q = q * np.array(
             [[dt**3 / 3.0, 0.0,         dt**2 / 2.0, 0.0],
@@ -216,27 +124,13 @@ class KalmanTracker:
             dtype=float,
         )
 
-    # ------------------------------------------------------------------
-    # Stage 2a — predict
-    # ------------------------------------------------------------------
-
     def predict(self) -> None:
         """
-        Propagate every active track forward one time step.
+        Propagate every active track forward one time step (constant-velocity model).
 
-        For each track i apply the constant-velocity model:
-
-            m^i_t|t-1  =  F  @  m^i_t-1
-            P^i_t|t-1  =  F  @  P^i_t-1  @  F.T  +  Q
-
-        Coast damping: while a track is UNMATCHED (misses > 0) its velocity
-        decays each cycle.  A pedestrian who disappears mid-stride has most
-        likely stopped or turned (measured: at walking-direction reversals an
-        undamped track coasts away on stale velocity and is never recaptured
-        -> a fresh ID spawns).  Damped coasting keeps the track near the last
-        sighting, so the returning person falls back inside its gate.
-
-        This is called automatically at the start of every update() cycle.
+        Coast damping: while a track is unmatched (misses > 0) its velocity decays
+        each cycle, keeping it near the last sighting so a returning person falls
+        back inside its gate.
         """
         for track in self.tracks:
             if track.misses > 0:
@@ -248,51 +142,25 @@ class KalmanTracker:
             # Keep P symmetric against floating-point drift.
             track.P = 0.5 * (track.P + track.P.T)
 
-    # ------------------------------------------------------------------
-    # Stage 2b — data association
-    # ------------------------------------------------------------------
-
     def associate(
         self,
         measurements: List[LegMeasurement],
     ) -> List[Tuple[int, int]]:
         """
-        Match measurements to existing tracks (global nearest-neighbour).
+        Match measurements to existing tracks (gated global nearest-neighbour).
 
         Args:
             measurements: LegMeasurement list from the current scan.
 
         Returns:
-            List of (track_index, measurement_index) pairs where
-            track_index  indexes into self.tracks and
-            meas_index   indexes into measurements.
+            List of (track_index, meas_index) pairs indexing self.tracks and
+            measurements. Unmatched measurements spawn tracks in update();
+            unmatched tracks have their miss counter incremented there.
 
-            Unmatched measurements → passed to update() for track spawning.
-            Unmatched tracks       → miss counter incremented in update().
-
-        Method (lecture "Gated NN Association", Module 4 p. 83 + Särkkä MTT
-        pp. 31–33):
-
-        1. Cost matrix C[i, j] = squared Mahalanobis distance between track
-           i's predicted measurement and measurement j:
-
-               d²_ij = v.T @ inv(S_ij) @ v
-               where v    = [meas.x - m[0], meas.y - m[1]]
-                     S_ij = H @ P @ H.T + R_j
-
-           Unlike a Euclidean cost, d² weighs the innovation by both the
-           track's and the detection's uncertainty, so the gate adapts to
-           range (far detections have larger R → wider gate).
-
-        2. Gate: any pair with d² > gate_chi2 is forbidden (cost set high).
-           γ = χ²₂ quantile (9.21 → 99 %): a correct association passes the
-           gate with that probability.
-
-        3. Solve the joint assignment with the Hungarian algorithm
-           (scipy.optimize.linear_sum_assignment) and drop assignments the
-           solver was forced to make through a gated-out pair.
-
-        If there are no tracks or no measurements, return [].
+        Cost is squared Mahalanobis distance d² = vᵀS⁻¹v, which weighs the
+        innovation by both track and detection uncertainty (so the gate adapts
+        to range); pairs with d² > gate_chi2 are gated out, and the Hungarian
+        algorithm solves the joint assignment.
         """
         n_tracks = len(self.tracks)
         n_meas = len(measurements)
@@ -323,18 +191,12 @@ class KalmanTracker:
             if C[i, j] <= self.gate_chi2                   # drop forced pairs
         ]
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     def _spawn_track(self, meas: LegMeasurement) -> None:
         """Initialise a new Track from an unmatched measurement."""
         m = np.array([meas.x, meas.y, 0.0, 0.0], dtype=float)
 
-        # Position uncertainty is seeded from the measurement's own
-        # covariance (what the detector actually knows about this point);
-        # velocity is unobserved, so it gets a generous prior of
-        # init_vel_std² that the filter shrinks as evidence arrives.
+        # Seed position uncertainty from the measurement covariance; velocity
+        # is unobserved, so give it a broad init_vel_std² prior.
         P = np.diag([
             max(meas.Rxx, 1e-4),
             max(meas.Ryy, 1e-4),
@@ -345,41 +207,8 @@ class KalmanTracker:
         self.tracks.append(Track(m=m, P=P, track_id=self._next_id))
         self._next_id += 1
 
-    # ------------------------------------------------------------------
-    # Stage 2c — full update cycle
-    # ------------------------------------------------------------------
-
     def update(self, measurements: List[LegMeasurement]) -> None:
-        """
-        Run one complete tracking cycle: predict → associate → KF update.
-
-        Steps
-        -----
-        1. Call self.predict() to propagate all tracks.
-        2. Call self.associate(measurements) to get matched pairs.
-        3. For each matched (track_index, meas_index) pair, apply the KF
-           update equations:
-
-               z   =  np.array([meas.x, meas.y])
-               R   =  np.array([[meas.Rxx, meas.Rxy],
-                                 [meas.Rxy, meas.Ryy]])
-               y   =  z  -  H @ m              # innovation
-               S   =  H  @  P  @  H.T  +  R   # innovation covariance
-               K   =  P  @  H.T  @  inv(S)    # Kalman gain
-               m   =  m  +  K  @  y            # updated mean
-               P   =  (I-KH) P (I-KH).T + K R K.T   # Joseph form
-
-           The Joseph form is algebraically identical to P - K S K.T but
-           stays positive-semidefinite under floating-point rounding.
-
-        4. For matched tracks: reset track.misses = 0 (and count the hit).
-           For unmatched tracks: increment track.misses by 1.
-
-        5. Spawn a new Track (via self._spawn_track) for every measurement
-           that was NOT matched to any existing track.
-
-        6. Remove tracks from self.tracks where track.misses > self.max_misses.
-        """
+        """Run one tracking cycle: predict → associate → KF update → spawn → prune → merge."""
         self.predict()
         assignments = self.associate(measurements)
 
@@ -388,7 +217,7 @@ class KalmanTracker:
 
         I4 = np.eye(4)
 
-        # Step 3 — KF measurement update for every matched pair.
+        # KF measurement update for every matched pair.
         for ti, mi in assignments:
             track = self.tracks[ti]
             meas = measurements[mi]
@@ -407,7 +236,7 @@ class KalmanTracker:
             track.P = I_KH @ track.P @ I_KH.T + K @ R @ K.T   # Joseph form
             track.P = 0.5 * (track.P + track.P.T)
 
-        # Step 4 — hit/miss bookkeeping and confirmation lifecycle.
+        # Hit/miss bookkeeping and confirmation lifecycle.
         for idx, track in enumerate(self.tracks):
             if idx in matched_track_idxs:
                 track.misses = 0
@@ -418,25 +247,16 @@ class KalmanTracker:
                 track.misses += 1
                 track.hits = 0      # confirmation needs *consecutive* hits
 
-        # Step 5 — spawn new tracks, but ONLY from measurements that fell
-        # outside EVERY existing gate (Särkkä MTT p. 33: "if no target
-        # satisfies this, this is either new target or outlier").  An
-        # unmatched measurement that lies inside some track's gate is most
-        # likely a duplicate detection of an already-tracked person — turning
-        # those into tracks causes duplicate-track churn.
-        #
-        # Walking-leg guard (measured on a recorded stride, frames 196-216 of
-        # the T2 session): mid-stride the front leg lands ~0.5 m ahead of the
-        # tracked body centre — outside every gate — and would spawn a
-        # duplicate that then steals the track when the legs come together.
-        # So ALSO suppress spawning near a confirmed MOVING track (its other
-        # leg zone). Static tracks don't suppress, so a new person appearing
-        # next to furniture is still picked up.
+        # Spawn only from measurements outside EVERY existing gate; one inside a
+        # gate is most likely a duplicate detection of a tracked person. Also
+        # suppress spawning near a confirmed MOVING track (its other leg zone)
+        # to avoid mid-stride duplicates; static tracks don't suppress, so a new
+        # person next to furniture is still picked up.
         for mi, meas in enumerate(measurements):
             if mi in matched_meas_idxs or mi in self._gated_meas_idxs:
                 continue
             if getattr(meas, 'occluded', False):
-                continue            # never BIRTH a track from a shadow-cut blob
+                continue            # never spawn a track from a shadow-cut blob
             near_moving = False
             for t in self.tracks:
                 if not t.confirmed:
@@ -448,17 +268,15 @@ class KalmanTracker:
             if not near_moving:
                 self._spawn_track(meas)
 
-        # Step 6 — prune tracks that have coasted too long.
+        # Prune tracks that have coasted too long.
         self.tracks = [t for t in self.tracks if t.misses <= self.max_misses]
 
-        # Step 7 — merge duplicate tracks of the same target (lecture p. 21:
-        # "track merging").  Same position AND same velocity = one person;
-        # crossing people share position only briefly but never velocity.
+        # Merge duplicate tracks: same position AND velocity = one person;
+        # crossing people share position only briefly, never velocity.
         self._merge_duplicate_tracks()
 
-        # Step 8 — static-object rejection (lecture Module 4 p. 198).  Flag a
-        # confirmed track as static when its displacement over the last
-        # `static_window` scans stays below `static_dist` (furniture, posts).
+        # Flag a confirmed track static when its displacement over the last
+        # static_window scans stays below static_dist (furniture, posts).
         live_ids = {t.track_id for t in self.tracks}
         self._pos_hist = {tid: h for tid, h in self._pos_hist.items()
                           if tid in live_ids}
@@ -500,16 +318,13 @@ class KalmanTracker:
                     continue
                 older, newer = (ti, tj) if ti.track_id < tj.track_id else (tj, ti)
                 if not newer.confirmed:
-                    # A newborn this close to an existing track is a duplicate
-                    # detection, not a new person — absorb it immediately
-                    # (its velocity estimate is still meaningless, so no
-                    # state adoption; the older track's estimate stands).
+                    # A newborn this close is a duplicate detection, not a new
+                    # person — absorb it (no state adoption, its velocity is
+                    # still meaningless).
                     removed.add(newer.track_id)
                 elif dv < self.merge_vel:
-                    # Two mature tracks agreeing in position AND velocity =
-                    # one target. Keep the older identity; adopt the fresher
-                    # estimate. (Crossing people agree in position only —
-                    # the velocity guard keeps them apart.)
+                    # Two mature tracks agreeing in position AND velocity = one
+                    # target; keep the older identity, adopt the fresher estimate.
                     fresher = ti if ti.misses <= tj.misses else tj
                     older.m = fresher.m.copy()
                     older.P = fresher.P.copy()
@@ -520,29 +335,18 @@ class KalmanTracker:
         if removed:
             self.tracks = [t for t in self.tracks if t.track_id not in removed]
 
-    # ------------------------------------------------------------------
-    # Prediction of future positions (course task 2.2)
-    # ------------------------------------------------------------------
-
     def predict_ahead(self, horizon: float) -> Dict[int, np.ndarray]:
         """
-        Forecast each track's future positions by iterating the KF
-        prediction step, WITHOUT modifying the tracker state.
-
-        Iterates m ← F m (and P ← F P Fᵀ + Q for the uncertainty) for
-        n = round(horizon / dt) steps, exactly as the course task asks:
-        "try how well you can predict the locations of the people by
-        iterating the Kalman filter prediction step for each target".
+        Forecast each track's future positions by iterating the KF prediction
+        step over round(horizon / dt) steps, WITHOUT modifying tracker state.
 
         Args:
             horizon: How far into the future to predict (seconds).
 
         Returns:
-            Dict mapping track_id → array of shape (n_steps, 3) whose rows
-            are [x, y, σ_pos] — predicted position and the 1σ position
-            uncertainty (max eigenvalue of the position covariance) at each
-            future step.  The growing σ shows how confidence decays with
-            prediction horizon.
+            Dict mapping track_id → array of shape (n_steps, 3) whose rows are
+            [x, y, σ_pos]: predicted position and the 1σ position uncertainty
+            (max eigenvalue of the position covariance) at each future step.
         """
         n_steps = max(1, int(round(horizon / self.dt)))
         out: Dict[int, np.ndarray] = {}
@@ -560,10 +364,6 @@ class KalmanTracker:
             out[track.track_id] = rows
 
         return out
-
-    # ------------------------------------------------------------------
-    # Read-only access
-    # ------------------------------------------------------------------
 
     def get_tracks(self) -> List[Track]:
         """Return a snapshot of the current active track list."""

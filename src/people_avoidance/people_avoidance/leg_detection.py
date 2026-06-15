@@ -1,18 +1,8 @@
 """
-leg_detection.py — Stage 1 of the people-avoidance pipeline.
+Stage 1 — LiDAR leg detection: LaserScan -> List[LegMeasurement].
 
-Input : sensor_msgs/LaserScan
-Output: List[LegMeasurement]
-
-Students implement:
-  - segment_scan()   : split the point cloud into contiguous clusters
-  - detect_legs()    : identify leg-pair candidates and assign covariance R
-
-Implementation follows "People Detection and Tracking from 2D LiDAR"
-(T. Kucner, Aalto/UBISS 2026):
-  - Module 1 — polar->Cartesian Jacobian covariance  (the R matrix)
-  - Module 2 — adaptive jump-distance segmentation    tau(r) = r*dtheta + k*sigma_r
-  - Module 3 — geometric pattern matching (width / circularity) + leg pairing
+Adaptive jump-distance segmentation, PCA shape gating, and a polar->Cartesian
+Jacobian covariance for each detected person.
 """
 from __future__ import annotations
 
@@ -24,74 +14,41 @@ import numpy as np
 from sensor_msgs.msg import LaserScan
 
 
-# ---------------------------------------------------------------------------
-# Sensor / model constants  (Kucner, UBISS 2026 — running example)
-# ---------------------------------------------------------------------------
-RANGE_STD          = 0.02    # sigma_r, range noise std (m)        [Module 1, p.12]
-SEG_NOISE_K        = 3.0     # k in tau(r) = r*dtheta + k*sigma_r  [Eq.(4), p.60]
-MIN_CLUSTER_POINTS = 3       # n_min — Leigh leg_tracker / SPENCER value
-                             # (lecture floor is 2; 3 drops more noise and at
-                             #  our 0.5° A1 still detects legs to ~3.5 m)
-CIRCULARITY_MIN    = 0.15    # reject clearly wall-like clusters (wall ratio <~0.1) [p.123]
+# Sensor / model constants
+RANGE_STD          = 0.02    # sigma_r, range noise std (m)
+SEG_NOISE_K        = 3.0     # k in tau(r) = r*dtheta + k*sigma_r
+MIN_CLUSTER_POINTS = 3       # n_min — drop noise clusters; still detects legs to ~3.5 m
+CIRCULARITY_MIN    = 0.15    # reject clearly wall-like (elongated) clusters
 PAIR_MIN_DIST      = 0.05    # min centre-to-centre to call two clusters a leg pair (m)
-COV_EPS            = 1e-9    # tiny diagonal floor so R stays positive-definite for the KF
-DETECT_MAX_RANGE   = 3.5     # legs are not detectable beyond this on our A1 in
-                             # this room: measured per-beam noise jumps from
-                             # 10 mm (2-3 m) to 180 mm median / 770 mm p90 at
-                             # 3-5 m -> far returns are ghost factories
-                             # (A/B on a 466-scan baseline: flicker cells 32->4,
-                             # tracker churn 113->17 IDs, false-moving 4->0).
-GAIT_STD           = 0.08    # gait wobble of the person-centre observation (m):
-                             # legs alternate around the body centre, so the
-                             # measurement noise of a PERSON position is ~8 cm,
-                             # not the mm-level sensor noise. Keeps the tracker
-                             # gate wide enough that stride motion never drops
-                             # the track (measured: ID switches 1 -> 0).
+COV_EPS            = 1e-9    # diagonal floor so R stays positive-definite for the KF
+DETECT_MAX_RANGE   = 3.5     # range cap — far returns flicker too hard to cluster
+GAIT_STD           = 0.08    # gait wobble ~8 cm: person-centre noise, not sensor noise
 
 
 @dataclass
 class LegMeasurement:
     """
-    One detected person expressed as a 2-D position with observation covariance.
+    One detected person: 2-D position with observation covariance, laser frame
+    (x forward, y left), metres / m².
 
-    Coordinate frame: the laser frame (x forward, y left).
-
-    The symmetric 2x2 measurement covariance matrix R is stored as three
-    independent entries so the Kalman filter can use them directly:
-
-        R = [[Rxx, Rxy],
-             [Rxy, Ryy]]
-
-    Fields
-    ------
-    x, y  : Person position in the laser frame (metres).
-    Rxx   : Variance along x (m²).
-    Rxy   : Cross-covariance term (m²).
-    Ryy   : Variance along y (m²).
+    x, y     : person position.
+    Rxx, Ryy : variances along x and y; Rxy: cross-covariance term.
+    R = [[Rxx, Rxy], [Rxy, Ryy]] is the symmetric 2x2 covariance for the KF.
     """
     x:   float
     y:   float
     Rxx: float
     Rxy: float
     Ryy: float
-    occluded: bool = False   # cluster edge is occlusion-cut (centroid suspect):
-                             # tracks may be UPDATED by it but never SPAWNED —
-                             # walking people sweep occlusion shadows along
-                             # walls, creating moving ghost clusters there
+    occluded: bool = False   # edge is occlusion-cut: may update a track, never spawn one
 
-
-# ---------------------------------------------------------------------------
-# Utility (provided — students do not need to modify this)
-# ---------------------------------------------------------------------------
 
 def scan_to_cartesian(scan: LaserScan) -> np.ndarray:
     """
-    Convert LaserScan polar readings to (x, y) Cartesian points in the laser frame.
+    Convert LaserScan polar readings to (x, y) points in the laser frame.
 
-    Invalid ranges (inf, nan, out-of-bounds) are dropped.
-
-    Returns:
-        Array of shape (N, 2).  May be empty (shape (0, 2)) if no valid readings.
+    Invalid ranges (inf, nan, out-of-bounds) are dropped. Returns an (N, 2)
+    array, possibly empty.
     """
     angles = np.linspace(scan.angle_min, scan.angle_max, len(scan.ranges))
     ranges = np.array(scan.ranges, dtype=float)
@@ -103,12 +60,10 @@ def scan_to_cartesian(scan: LaserScan) -> np.ndarray:
     )
     r = ranges[valid]
     a = angles[valid]
-    return np.column_stack((r * np.cos(a), r * np.sin(a)))  # (N, 2)
+    return np.column_stack((r * np.cos(a), r * np.sin(a)))
 
 
-# ---------------------------------------------------------------------------
 # Stage 1a — segmentation
-# ---------------------------------------------------------------------------
 
 def segment_scan(
     points: np.ndarray,
@@ -118,36 +73,22 @@ def segment_scan(
     k: float = SEG_NOISE_K,
 ) -> List[np.ndarray]:
     """
-    Split a sorted point cloud into contiguous clusters.
+    Split a scan-ordered point cloud into contiguous clusters.
 
-    Two consecutive points belong to the same segment when their Euclidean
-    distance is below *distance_threshold* (metres).
+    Two consecutive points join the same segment when their gap is below the
+    threshold. When *angle_increment* is given, the threshold is adaptive:
+    tau(r) = r * Δθ + k * sigma_r at the previous beam's range — it grows with
+    range (point spacing ~ r·Δθ) and floors at distance_threshold up close.
 
     Args:
-        points:             (N, 2) array of Cartesian scan points, in scan order.
-        distance_threshold: Maximum gap between consecutive points in a segment (m)
-                            — used when *angle_increment* is None (fixed-threshold mode).
-        angle_increment:    Angular step Δθ between beams (rad).  When provided, the
-                            gap test uses the adaptive jump-distance threshold from
-                            the lecture, Eq. (4):
-                                tau(r) = r * Δθ + k * sigma_r
-                            evaluated at the previous beam's range r = ||p_{i-1}||.
-                            This grows with range (point spacing ~ r·Δθ) and falls
-                            back to the noise floor k·sigma_r up close.
-        sigma_r:            Range noise std used in the adaptive threshold (m).
-        k:                  Noise multiplier in the adaptive threshold (default 3).
+        points:             (N, 2) Cartesian scan points, in scan order.
+        distance_threshold: Gap floor / fixed threshold when angle_increment is None (m).
+        angle_increment:    Beam angular step Δθ (rad); enables the adaptive threshold.
+        sigma_r:            Range noise std (m).
+        k:                  Noise multiplier (default 3).
 
     Returns:
-        List of (K_i, 2) arrays, one per segment.  Empty list if points is empty.
-
-    FH-style segmentation (single O(N) pass):
-            current_segment = [points[0]]
-            for i in range(1, len(points)):
-                if dist(points[i], points[i-1]) > threshold:
-                    yield current_segment
-                    current_segment = []
-                current_segment.append(points[i])
-            yield current_segment
+        List of (K_i, 2) arrays, one per segment. Empty if points is empty.
     """
     n = len(points)
     if n == 0:
@@ -160,45 +101,41 @@ def segment_scan(
         gap = float(np.linalg.norm(points[i] - points[i - 1]))
 
         if angle_increment is not None:
-            # Adaptive jump-distance threshold — lecture Eq. (4): tau(r)=r*dtheta+k*sigma_r,
-            # floored by distance_threshold so that parameter still has a tuning effect
-            # (raise it to merge nearby clusters; lower it to let the adaptive term rule).
-            r_prev = float(np.linalg.norm(points[i - 1]))   # range = distance from sensor (origin)
+            # Adaptive threshold tau(r)=r*dtheta+k*sigma_r, floored by distance_threshold.
+            r_prev = float(np.linalg.norm(points[i - 1]))
             threshold = max(distance_threshold, r_prev * float(angle_increment) + k * sigma_r)
         else:
             threshold = distance_threshold
 
         if gap > threshold:
-            segments.append(np.asarray(current))   # close off this segment
-            current = []                            # start a new one
+            segments.append(np.asarray(current))
+            current = []
 
         current.append(points[i])
 
-    segments.append(np.asarray(current))            # don't forget the last segment
+    segments.append(np.asarray(current))
     return segments
 
 
-# ---------------------------------------------------------------------------
 # Stage 1b — leg detection and covariance assignment
-# ---------------------------------------------------------------------------
 
 def _cluster_shape(seg: np.ndarray) -> Tuple[float, float]:
     """
-    Geometric features of a cluster via PCA  (lecture Module 3, pp. 122-123).
+    PCA geometric features of a cluster.
 
     Returns:
         width        : extent along the principal axis (m).
-        circularity  : lambda_min / lambda_max  in [0, 1].
-                       ~1 for a round blob (leg / pole), ~0 for an elongated run (wall).
+        circularity  : lambda_min / lambda_max in [0, 1]; ~1 round blob (leg),
+                       ~0 elongated run (wall).
     """
     npts = seg.shape[0]
     if npts < 2:
         return 0.0, 0.0
     centred = seg - seg.mean(axis=0)
-    cov = (centred.T @ centred) / npts          # 2x2 point-distribution covariance
+    cov = (centred.T @ centred) / npts
     evals, evecs = np.linalg.eigh(cov)          # ascending: evals[0] <= evals[1]
     lam_min, lam_max = float(evals[0]), float(evals[1])
-    e1 = evecs[:, 1]                            # principal axis (largest eigenvalue)
+    e1 = evecs[:, 1]                            # principal axis
     proj = centred @ e1
     width = float(proj.max() - proj.min())
     circularity = (lam_min / lam_max) if lam_max > 1e-12 else 0.0
@@ -209,15 +146,9 @@ def _cluster_covariance(
     centroid: np.ndarray, n: int, sigma_theta: float
 ) -> np.ndarray:
     """
-    Centroid covariance Sigma_k ~= Sigma_xy / n   (lecture Eq. 2 + Eq. 5).
-
-    Sigma_xy = J * diag(sigma_r^2, sigma_theta^2) * J^T, evaluated at the cluster
-    centroid (r, theta):
-        Rxx = sr2*cos^2 + r2t2*sin^2
-        Rxy = (sr2 - r2t2)*sin*cos
-        Ryy = sr2*sin^2 + r2t2*cos^2
-    with sr2 = sigma_r^2 and r2t2 = (r*sigma_theta)^2.  Dividing by n is the
-    covariance-of-the-mean: more points -> tighter estimate.
+    Centroid covariance: the polar->Cartesian Jacobian covariance
+    Sigma_xy = J * diag(sigma_r^2, sigma_theta^2) * J^T at (r, theta), divided
+    by n (covariance-of-the-mean: more points -> tighter estimate).
     """
     r = float(np.linalg.norm(centroid))
     theta = float(np.arctan2(centroid[1], centroid[0]))
@@ -247,45 +178,30 @@ def detect_legs(
     max_leg_width: float = 0.25,
 ) -> List[LegMeasurement]:
     """
-    Detect people from a LaserScan using geometric leg-pair matching (FH style).
-
-    Pipeline
-    --------
-    1. Convert scan to Cartesian via scan_to_cartesian()  [provided].
-    2. Segment the point cloud into contiguous clusters via segment_scan()  [TODO].
-    3. For each segment whose width matches a single leg (≈ leg_radius), mark
-       it as a leg candidate.
-    4. Pair leg candidates whose midpoint separation is ≤ max_leg_width; the
-       person position is the midpoint of the two leg centres.
-    5. Assign observation covariance R for each detected person:
-       a simple range-dependent isotropic model works as a starting point —
-       Rxx = Ryy = σ², Rxy = 0, where σ grows with distance from the sensor.
+    Detect people from a LaserScan via geometric leg-pair matching: segment,
+    gate clusters by width/circularity, pair candidates within max_leg_width
+    (person at the midpoint), and assign each a Jacobian covariance R.
 
     Args:
         scan:               Incoming LaserScan message.
         distance_threshold: Segmentation gap threshold (m).
         leg_radius:         Expected radius of a single leg segment (m).
-        max_leg_width:      Maximum distance between the centres of two paired
-                            leg segments (m).
+        max_leg_width:      Max centre-to-centre distance of two paired legs (m).
 
     Returns:
-        List of LegMeasurement.  Returns [] until students implement the body.
+        List of LegMeasurement.
     """
     points = scan_to_cartesian(scan)
     if points.shape[0] == 0:
         return []
-    # Range cap: beyond DETECT_MAX_RANGE this sensor's returns flicker too
-    # hard to form stable leg clusters (see constant above).
+    # Range cap — far returns flicker too hard to form stable leg clusters.
     points = points[np.hypot(points[:, 0], points[:, 1]) <= DETECT_MAX_RANGE]
     if points.shape[0] == 0:
         return []
 
-    # Occlusion-edge test data: for any point we can find its beam index and
-    # ask whether the neighbouring beam is SIGNIFICANTLY CLOSER — i.e. the
-    # cluster continues behind a nearer object and is occlusion-cut there.
-    # A sliding occluder (a walking person) sweeps such cut clusters along
-    # walls, producing MOVING ghost detections (measured: 38 phantom moving
-    # tracks in a 2-person session). Reject clusters cut on either edge.
+    # Occlusion-cut: a cluster edge whose neighbouring beam is much closer
+    # continues behind a nearer object; such edges sweep moving wall ghosts as
+    # an occluder passes, so clusters cut on either edge are flagged.
     _ranges = np.asarray(scan.ranges, dtype=float)
     _nbeams = len(_ranges)
 
@@ -301,13 +217,13 @@ def detect_legs(
                     return True
         return False
 
-    # Angular step (rad) and bearing noise sigma_theta = dtheta / sqrt(12)  [Module 1, p.30].
+    # Bearing noise sigma_theta = dtheta / sqrt(12) from the angular step.
     dtheta = float(scan.angle_increment) if scan.angle_increment else 0.0
     if dtheta <= 0.0:
-        dtheta = np.radians(1.0)                 # safe fallback (running example uses 1 deg)
+        dtheta = np.radians(1.0)                 # safe fallback
     sigma_theta = dtheta / np.sqrt(12.0)
 
-    # ── Stage 1a: adaptive segmentation (lecture Eq. 4) ──────────────────────
+    # Stage 1a: adaptive segmentation
     segments = segment_scan(
         points,
         distance_threshold=distance_threshold,
@@ -316,34 +232,23 @@ def detect_legs(
         k=SEG_NOISE_K,
     )
 
-    # ── Stage 1b(i): classify each cluster as a leg candidate ────────────────
-    #   width gate  — single leg ≈ 2*leg_radius; allow legs-together (Pattern B).
-    #   circularity — reject clearly elongated runs (walls).
+    # Stage 1b(i): classify each cluster as a leg candidate by width / circularity.
     single_leg_width = 2.0 * leg_radius
     width_max = max(1.8 * single_leg_width, max_leg_width)   # legs-together allowance
-    # Lower width gate (lecture Module 3, w_min): reject clusters far thinner
-    # than any real leg (wires, thin poles ≲3 cm).  Kept as a conservative
-    # absolute floor so it never rejects a genuine leg (≥6 cm) even when
-    # leg_radius is set large.
+    # Absolute floor: reject clusters far thinner than any leg (wires, thin poles).
     width_min = 0.03
     candidates = []  # each: {'p': centroid(2,), 'n': int, 'R': (2,2)}
     for seg in segments:
         n = seg.shape[0]
-        if n < MIN_CLUSTER_POINTS:               # n_min filter — drop noise clusters
+        if n < MIN_CLUSTER_POINTS:               # drop noise clusters
             continue
         width, circularity = _cluster_shape(seg)
         if width > width_max:                    # too wide -> wall / large object
             continue
         if n >= 4 and width < width_min:         # too thin -> pole/wire, not a leg
             continue
-        # Secondary wall filter: only drop a cluster that is BOTH wider than a single
-        # leg AND clearly linear AND well-sampled (a wall fragment).  A narrow,
-        # leg-sized cluster is never rejected on circularity — a real leg's front arc
-        # can look thin (low circularity) yet still be a leg.
-        # Wall filter applies only to genuinely WALL-scale clusters (>0.45 m).
-        # A walking person's merged legs form a 0.15-0.35 m elongated blob —
-        # rejecting those dropped the person every stride (measured 79%->100%
-        # detection coverage on a recorded walking session after this fix).
+        # Wall filter: reject only wall-scale clusters (>0.45 m) that are clearly
+        # linear and well-sampled; a leg's thin front arc must not be dropped here.
         if n >= 5 and width > max(0.45, single_leg_width) and circularity < CIRCULARITY_MIN:
             continue
         centroid = seg.mean(axis=0)
@@ -354,11 +259,9 @@ def detect_legs(
     if not candidates:
         return []
 
-    # ── Stage 1b(ii): assemble persons from leg candidates ───────────────────
-    #   Pattern A — two candidates within [PAIR_MIN_DIST, max_leg_width] -> one person
-    #               at the midpoint, R = 1/4 (R_A + R_B)              [lecture p.142].
-    #   Pattern B/C — an unpaired candidate is a person on its own
-    #               (legs together / single visible leg).
+    # Stage 1b(ii): assemble persons. A paired candidate (within
+    # [PAIR_MIN_DIST, max_leg_width]) gives a person at the midpoint with
+    # R = 1/4 (R_A + R_B); an unpaired candidate is a person on its own.
     measurements: List[LegMeasurement] = []
     used = [False] * len(candidates)
 
