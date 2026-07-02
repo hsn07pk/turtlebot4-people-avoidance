@@ -30,6 +30,34 @@ and a browser dashboard lets you watch and tune the whole pipeline live.
 /cmd_vel  →  TurtleBot4 moves
 ```
 
+## Node and topic graph
+
+As wired by `people_avoidance.launch.py` and `simulation.launch.py`:
+
+```mermaid
+flowchart LR
+    subgraph source["TurtleBot4  (or Gazebo through ros_gz bridges)"]
+        lidar["RPLidar A1"]
+        base["Create 3 base"]
+    end
+    subgraph sim["simulation only"]
+        gz["gz sim: simple_room.sdf"]
+        ped["pedestrian_sim_node"]
+        bridge["ros_gz parameter_bridge (/clock + turtlebot4_spawn bridges)"]
+        ped -- "gz service /world/warehouse/create + /set_pose" --> gz
+        gz --- bridge
+    end
+    lidar -- "/scan (LaserScan, best-effort QoS)" --> node["people_avoidance_node"]
+    base -- "/odom (Odometry, best-effort QoS)" --> node
+    node -- "/cmd_vel (Twist)" --> base
+    dash["test.py dashboard on :8080"] -. "same /scan + /odom in, /cmd_vel out" .-> base
+```
+
+`pedestrian_sim_node` spawns each pedestrian as a two-cylinder leg pair (0.10 m
+radius, hip-width apart) and drives them on a bounded random walk with
+`gz service` pose calls, so the LiDAR sees the same two-blob pattern as real
+legs.
+
 ## How it works
 
 ### 1. Detection: `leg_detection.py`
@@ -66,6 +94,31 @@ robot cannot be driven into a person by hand.
 `people_avoidance_node.py` connects the three stages to ROS 2 topics and handles
 the hardware quirks: the RPLidar A1 is mounted rotated 90° on the TurtleBot4,
 and its sensor topics use BEST_EFFORT QoS.
+
+## Parameters
+
+Values set in `people_avoidance.launch.py` (node defaults in
+`people_avoidance_node.py` differ where noted):
+
+| Parameter | Launch value | Meaning |
+|---|---|---|
+| `scan_topic` | `/scan` | LaserScan input |
+| `cmd_vel_topic` | `/cmd_vel` | Twist output |
+| `odom_topic` | `/odom` | Odometry input |
+| `laser_frame` / `odom_frame` | `rplidar_link` / `odom` | TF frames |
+| `dt` | 0.13 s | Filter step; matches the A1's ~7.7 Hz scan rate (default 0.1) |
+| `max_misses` | 5 | Frames without a match before a track is deleted |
+| `distance_threshold` | 0.13 m | Segmentation jump-distance base (default 0.1) |
+| `leg_radius` | 0.06 m | Expected single-leg radius (default 0.10) |
+| `max_leg_width` | 0.65 m | Max separation when pairing legs (default 0.25) |
+| `laser_yaw_offset` | 1.5708 rad | Lidar mount yaw; +90 deg on this TB4 (default 0.0) |
+| `max_linear_speed` | 0.2 m/s | Speed cap |
+| `max_angular_speed` | 1.0 rad/s | Turn-rate cap |
+| `obstacle_radius_scale` | 2.0 | Safety-radius inflation per track uncertainty |
+
+`simulation.launch.py` adds `model` (`standard`/`lite`), `num_people` (2),
+`ped_speed` (0.5 m/s), and `boundary_radius` (3.5 m); the pedestrian node also
+takes `turn_noise_std` (0.4 rad) and `update_hz` (5.0).
 
 ## Live dashboard
 
